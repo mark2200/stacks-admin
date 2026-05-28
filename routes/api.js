@@ -10,7 +10,7 @@ const { distributeReferralCommission } = require('./commissionService');
 const router = express.Router();
 
 // ========== MODELS WITH EXPLICIT SCHEMA ==========
-// Added tokenIssuedAt and tokenInvalidBefore to support server-side invalidation (per-user)
+// Updated to support multiple concurrent sessions per user via tokens array
 // Keep strict: false for compatibility with existing documents
 const userSchema = new mongoose.Schema({
   username: String,
@@ -23,21 +23,30 @@ const userSchema = new mongoose.Schema({
   balance: { type: Number, default: 0 },
   commission: { type: Number, default: 0 },
   commissionToday: { type: Number, default: 0 },
-  lastCommissionReset: { type: String, default: "" }, // <-- Added for midnight reset tracking
+  lastCommissionReset: { type: String, default: "" },
   vipLevel: { type: Number, default: 1 },
   inviteCode: String,
   referredBy: String,
+  // ===== MULTI-SESSION SUPPORT =====
+  tokens: {
+    type: [
+      {
+        value: String,
+        issuedAt: Number
+      }
+    ],
+    default: []
+  },
+  // Keep legacy fields for backward compatibility (deprecated but won't hurt)
   token: { type: String, default: "" },
-  tokenIssuedAt: { type: Number, default: null }, // timestamp (ms) when token was issued
-  tokenInvalidBefore: { type: Number, default: 0 }, // invalidate tokens issued before this per-user timestamp
+  tokenIssuedAt: { type: Number, default: null },
+  tokenInvalidBefore: { type: Number, default: 0 },
+  // ===== END MULTI-SESSION SUPPORT =====
   suspended: { type: Boolean, default: false },
   currentSet: { type: Number, default: 1 },
-  // store starting balance for current set so we can enforce min-product-price rule
   setStartingBalance: { type: Number, default: null },
   createdAt: String,
-
-  // New fields for credit score & admin flag
-  creditScore: { type: Number, default: 100 }, // 0 - 100 scale, default 100%
+  creditScore: { type: Number, default: 100 },
   isAdmin: { type: Boolean, default: false },
 
 }, { collection: 'users', strict: false });
@@ -56,16 +65,16 @@ const Setting = mongoose.models.Setting || mongoose.model('Setting', new mongoos
 // Create helpful indexes (best-effort at startup). This speeds token/user lookups and the task count query.
 (async () => {
   try {
-    // user token lookup
+    // user token lookup - now searching in tokens array
     if (User && User.collection) {
-      await User.collection.createIndex({ token: 1 }, { background: true }).catch(() => {});
+      await User.collection.createIndex({ "tokens.value": 1 }, { background: true }).catch(() => {});
       await User.collection.createIndex({ username: 1 }, { background: true }).catch(() => {});
     }
     // task count: username + status + set
     if (Task && Task.collection) {
       await Task.collection.createIndex({ username: 1, status: 1, set: 1 }, { background: true }).catch(() => {});
     }
-    console.log('DB indexes ensured: users(token, username), tasks(username,status,set)');
+    console.log('DB indexes ensured: users(tokens.value, username), tasks(username,status,set)');
   } catch (err) {
     console.warn('Index creation warning:', err && err.message ? err.message : err);
   }
@@ -399,27 +408,38 @@ async function checkPlatformStatus(req, res, next) {
   }
 }
 
-// ========== Auth middleware (enhanced to support global/per-user invalidation) ==========
+// ========== Auth middleware (UPDATED FOR MULTI-SESSION) ==========
 const verifyUserToken = async (req, res, next) => {
     const token = req.headers['x-auth-token'] || req.headers['X-Auth-Token'] || (req.headers.authorization ? (req.headers.authorization.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null) : null);
     if (!token) {
         return res.status(403).json({ success: false, message: 'Missing authentication token' });
     }
-    // find user by token (existing approach)
-    const user = await User.findOne({ token });
+
+    // Find user by token in tokens array (NEW MULTI-SESSION LOGIC)
+    const user = await User.findOne({ "tokens.value": token });
     if (!user) return res.status(403).json({ success: false, message: 'Invalid or expired token' });
 
     try {
+      // Find the specific token object to check issuedAt
+      const tokenObj = user.tokens && user.tokens.find(t => t && t.value === token);
+      if (!tokenObj) {
+        return res.status(403).json({ success: false, message: 'Invalid or expired token' });
+      }
+
       // check per-user and global invalidation timestamps
       const settings = await getOrCreateSettings();
       const globalInvalidBefore = Number(settings.globalTokenInvalidBefore || 0);
       const userInvalidBefore = Number(user.tokenInvalidBefore || 0);
-      const issuedAt = Number(user.tokenIssuedAt || 0);
+      const issuedAt = Number(tokenObj.issuedAt || 0);
+
       if (issuedAt && (issuedAt < globalInvalidBefore || issuedAt < userInvalidBefore)) {
         // token was issued before invalidation threshold
-        // clear token on server side (best-effort) to prevent further use
+        // remove this token from the array (best-effort)
         try {
-          await User.updateOne({ _id: user._id }, { $set: { token: "", tokenIssuedAt: null } });
+          await User.updateOne(
+            { _id: user._id },
+            { $pull: { tokens: { value: token } } }
+          );
         } catch (e) {}
         return res.status(403).json({ success: false, message: 'Invalid or expired token' });
       }
@@ -429,13 +449,13 @@ const verifyUserToken = async (req, res, next) => {
     }
 
     req.user = user;
+    req.token = token; // Store the token for potential logout use
     next();
 };
 
 // ========== Endpoints ==========
 
 // Settings
-// --- Replace the existing router.get('/settings', ...) handler with this block ---
 router.get('/settings', async (req, res) => {
   try {
     const settings = await getOrCreateSettings();
@@ -481,7 +501,6 @@ router.get('/settings', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Failed to load settings' });
   }
 });
-// --- end replacement block ---
 
 // Registration
 router.post('/users/register', async (req, res) => {
@@ -524,6 +543,10 @@ router.post('/users/register', async (req, res) => {
         return res.status(500).json({ success: false, message: "Failed to generate unique invitation code." });
     }
 
+    // Create initial token for registration
+    const initialToken = crypto.randomBytes(24).toString('hex');
+    const issuedAt = Date.now();
+
     const newUser = {
         username: username.trim(),
         phone: phone.trim(),
@@ -536,14 +559,14 @@ router.post('/users/register', async (req, res) => {
         balance: 0,
         commission: 0,
         commissionToday: 0,
-        lastCommissionReset: "", // <-- Added here for new users
+        lastCommissionReset: "",
         taskCountToday: 0,
         suspended: false,
-        token: crypto.randomBytes(24).toString('hex'),
-        tokenIssuedAt: Date.now(),
+        tokens: [{ value: initialToken, issuedAt }], // NEW: tokens array
+        token: initialToken, // Keep for backward compatibility
+        tokenIssuedAt: issuedAt, // Keep for backward compatibility
         createdAt: new Date().toISOString(),
         currentSet: 1,
-        // ensure new users start at full credit
         creditScore: 100
     };
 
@@ -552,7 +575,7 @@ router.post('/users/register', async (req, res) => {
     return res.json({ success: true, user: newUser });
 });
 
-// Authentication (login) — trigger async cache pre-warm so subsequent start-task is fast
+// Authentication (login) — UPDATED FOR MULTI-SESSION
 router.post('/login', async (req, res) => {
     const input = req.body.input || req.body.username || "";
     const password = req.body.password;
@@ -563,9 +586,27 @@ router.post('/login', async (req, res) => {
     if (user) {
         if (user.suspended) return res.status(403).json({ success: false, message: 'Account suspended' });
 
-        // Issue a new token and record issued time to support global/per-user invalidation
-        user.token = crypto.randomBytes(24).toString('hex');
-        user.tokenIssuedAt = Date.now();
+        // Create new token for this login session (NEW MULTI-SESSION LOGIC)
+        const newToken = crypto.randomBytes(24).toString('hex');
+        const issuedAt = Date.now();
+
+        // Initialize tokens array if it doesn't exist (for migrating old users)
+        if (!Array.isArray(user.tokens)) {
+          user.tokens = [];
+        }
+
+        // Add new token to array
+        user.tokens.push({ value: newToken, issuedAt });
+
+        // Optionally limit tokens array to prevent unbounded growth (e.g., keep last 10 sessions)
+        if (user.tokens.length > 10) {
+          user.tokens = user.tokens.slice(-10);
+        }
+
+        // Keep legacy fields for backward compatibility
+        user.token = newToken;
+        user.tokenIssuedAt = issuedAt;
+
         await user.save();
 
         // pre-warm product cache (non-blocking)
@@ -573,7 +614,9 @@ router.post('/login', async (req, res) => {
           console.warn('Cloudinary pre-warm after login failed:', err && err.message ? err.message : err);
         });
 
-        return res.json({ success: true, user });
+        // Return user with the new token
+        const userObj = user.toObject ? user.toObject() : user;
+        return res.json({ success: true, user: { ...userObj, token: newToken } });
     }
     res.status(401).json({ success: false, message: 'Invalid credentials' });
 });
@@ -1007,7 +1050,7 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
           const vipInfo = vipRules[user.vipLevel] || vipRules[1];
           const completedCount = await Task.countDocuments({ username: user.username, set: taskSet, status: { $regex: /^completed$/i } });
           if (completedCount >= (vipInfo.tasks || 40)) {
-            const todayKey = getUKDateKey();
+            const todayKey = new Date().toISOString().slice(0, 10);
             // Atomically increment registeredWorkingDays[todayKey], and mark that reset is requested.
             // IMPORTANT: do NOT auto-increment currentSet anymore.
             const updates = {
@@ -1076,7 +1119,7 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
         const taskSet = task.set || 1;
         const completedCount = await Task.countDocuments({ username: user.username, set: taskSet, status: { $regex: /^completed$/i } });
         if (completedCount >= (vipInfo.tasks || 40)) {
-          const todayKey = getUKDateKey();
+          const todayKey = new Date().toISOString().slice(0, 10);
           // Atomically increment registeredWorkingDays[todayKey] and set resetRequested flag.
           // IMPORTANT: do NOT auto-increment currentSet anymore.
           const updates = {
@@ -1107,6 +1150,7 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
       return res.status(500).json({ success: false, message: 'Internal server error', error: err.message });
     }
 });
+
 // ----------------------- Admin Endpoint: Reset User Task Set -----------------------
 router.post('/admin/reset-user-task-set', async (req, res) => {
     const { username, adminSecret } = req.body;
@@ -1241,8 +1285,8 @@ router.post('/admin/invalidate-all-tokens', async (req, res) => {
     const settings = await getOrCreateSettings();
     const ts = Date.now();
     await Setting.updateOne({ _id: settings._id }, { $set: { globalTokenInvalidBefore: ts } });
-    // Optionally clear tokens on users in background (best-effort)
-    // await User.updateMany({}, { $set: { token: "", tokenIssuedAt: null } });
+    // Clear all tokens for all users
+    await User.updateMany({}, { $set: { tokens: [], token: "", tokenIssuedAt: null } });
     return res.json({ success: true, message: 'All tokens invalidated.', globalTokenInvalidBefore: ts });
   } catch (err) {
     console.error('invalidate-all-tokens error:', err);
@@ -1270,7 +1314,8 @@ router.post('/admin/invalidate-user-token', async (req, res) => {
 
     const ts = Date.now();
     user.tokenInvalidBefore = ts;
-    // Optionally clear existing token field so immediate effect for those holding same token string
+    // Clear all tokens for this user
+    user.tokens = [];
     user.token = "";
     user.tokenIssuedAt = null;
     await user.save();
@@ -1279,6 +1324,30 @@ router.post('/admin/invalidate-user-token', async (req, res) => {
   } catch (err) {
     console.error('invalidate-user-token error:', err);
     return res.status(500).json({ success: false, message: 'Failed to invalidate user tokens' });
+  }
+});
+
+// ----------------------- LOGOUT ENDPOINT (NEW) -----------------------
+// Allows a user to logout from current session (removes only the current token)
+router.post('/logout', verifyUserToken, async (req, res) => {
+  try {
+    const token = req.token; // Set by verifyUserToken middleware
+    const user = req.user;
+
+    if (!token || !user) {
+      return res.status(401).json({ success: false, message: 'Invalid session' });
+    }
+
+    // Remove only the current token from the tokens array
+    await User.updateOne(
+      { _id: user._id },
+      { $pull: { tokens: { value: token } } }
+    );
+
+    return res.json({ success: true, message: 'Logged out successfully' });
+  } catch (err) {
+    console.error('logout error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to logout' });
   }
 });
 
@@ -1411,7 +1480,9 @@ router.post('/change-password', verifyUserToken, async (req, res) => {
     }
 
     user.loginPassword = newPassword;
-    user.token = ""; // Invalidate token on password change (force re-login across devices)
+    // Clear all tokens on password change (force re-login across all devices)
+    user.tokens = [];
+    user.token = "";
     user.tokenIssuedAt = null;
     await user.save();
 
