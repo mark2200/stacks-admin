@@ -34,6 +34,8 @@ const Setting = mongoose.models.Setting || mongoose.model('Setting', new mongoos
     if (User && User.collection && typeof User.collection.createIndex === 'function') {
       User.collection.createIndex({ token: 1 }, { sparse: true }).catch(e => console.warn('User token index create failed:', e && e.message ? e.message : e));
       User.collection.createIndex({ username: 1 }).catch(e => console.warn('User username index create failed:', e && e.message ? e.message : e));
+      // index on createdAt to speed up newest-first queries
+      User.collection.createIndex({ createdAt: -1 }).catch(e => console.warn('User createdAt index create failed:', e && e.message ? e.message : e));
     }
   } catch (e) {
     console.warn('Index creation block error:', e && e.message ? e.message : e);
@@ -624,7 +626,7 @@ router.post('/settings', asyncHandler(async (req, res) => {
     Optional query params:
       - page (default 1)
       - limit (default 50, max 200)
-      - sort (default -createdAt)
+      - sort (default newest-first: createdAt desc, _id desc)
       - fields (comma-separated projection e.g. username,phone,balance)
       - q (search string for username or phone)
   Returns:
@@ -634,7 +636,6 @@ router.get('/users', asyncHandler(async (req, res) => {
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const skip = (page - 1) * limit;
-    const sort = req.query.sort || '-createdAt';
     const fields = req.query.fields ? req.query.fields.split(',').join(' ') : 'username phone balance status createdAt';
 
     const q = req.query.q ? String(req.query.q).trim() : null;
@@ -647,9 +648,18 @@ router.get('/users', asyncHandler(async (req, res) => {
       ];
     }
 
+    // Default sort: newest first by createdAt, then by _id
+    let sortObj;
+    if (req.query.sort) {
+      // if a sort string provided (e.g., -createdAt), use it
+      sortObj = req.query.sort;
+    } else {
+      sortObj = { createdAt: -1, _id: -1 };
+    }
+
     const [total, users] = await Promise.all([
       User.countDocuments(filter),
-      User.find(filter).select(fields).sort(sort).skip(skip).limit(limit).lean()
+      User.find(filter).select(fields).sort(sortObj).skip(skip).limit(limit).lean()
     ]);
 
     res.json({ total, page, limit, users });
@@ -663,7 +673,8 @@ router.get('/users/search', asyncHandler(async (req, res) => {
     const limit = Math.min(50, Math.max(5, Number(req.query.limit) || 20));
     const regex = new RegExp(`^${escapeRegExp(q)}`, 'i');
     const users = await User.find({ $or: [{ username: regex }, { phone: regex }] })
-      .select('username phone balance')
+      .select('username phone balance createdAt')
+      .sort({ createdAt: -1, _id: -1 })
       .limit(limit)
       .lean();
     res.json(users);
@@ -671,7 +682,7 @@ router.get('/users/search', asyncHandler(async (req, res) => {
 
 router.post('/users', asyncHandler(async (req, res) => {
     // Debug log incoming payload for visibility
-    try { console.log('POST /admin/users payload:', JSON.stringify(req.body).slice(0, 2000)); } catch (e) { /* ignore */ }
+    try { console.log('POST /admin/users payload:', JSON.stringify(req.body).slice(0,2000)); } catch (e) { /* ignore */ }
 
     // Defensive: remove any client-supplied _id or id so server controls _id generation
     if (req.body && (req.body._id || req.body.id)) {
@@ -684,6 +695,8 @@ router.post('/users', asyncHandler(async (req, res) => {
     const exists = await User.findOne({ username }).lean();
     if (exists) return res.status(409).json({ success: false, message: 'Username already exists' });
 
+    const nowIso = new Date().toISOString();
+
     const user = {
         username,
         phone,
@@ -693,7 +706,8 @@ router.post('/users', asyncHandler(async (req, res) => {
         tasksCompletedInSet: 0,
         tasksSetSize: 40,
         exchange: exchange || "",
-        walletAddress: walletAddress || ""
+        walletAddress: walletAddress || "",
+        createdAt: req.body && req.body.createdAt ? req.body.createdAt : nowIso
     };
 
     try {
