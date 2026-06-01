@@ -621,22 +621,11 @@ router.post('/settings', asyncHandler(async (req, res) => {
 }));
 
 // ===================== USERS API (RESTful) ===================== //
-/*
-  GET /admin/users
-    Optional query params:
-      - page (default 1)
-      - limit (default 50, max 200)
-      - sort (default newest-first: createdAt desc, _id desc)
-      - fields (comma-separated projection e.g. username,phone,balance)
-      - q (search string for username or phone)
-  Returns:
-    { total, page, limit, users: [...] }
-*/
 router.get('/users', asyncHandler(async (req, res) => {
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const skip = (page - 1) * limit;
-    const fields = req.query.fields ? req.query.fields.split(',').join(' ') : 'username phone balance status createdAt';
+    const fields = req.query.fields ? req.query.fields.split(',').join(' ') : 'username phone balance status createdAt vipLevel currentSet exchange walletAddress';
 
     const q = req.query.q ? String(req.query.q).trim() : null;
     const filter = {};
