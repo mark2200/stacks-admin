@@ -24,6 +24,22 @@ const Notification = mongoose.models.Notification || mongoose.model('Notificatio
 const Log = mongoose.models.Log || mongoose.model('Log', new mongoose.Schema({}, { collection: 'logs', strict: false }));
 const Setting = mongoose.models.Setting || mongoose.model('Setting', new mongoose.Schema({}, { collection: 'settings', strict: false }));
 
+// ---------- Best-effort index creation (non-blocking) ----------
+(async () => {
+  try {
+    // These are non-blocking best-effort index creations. They will log if they fail.
+    if (Admin && Admin.collection && typeof Admin.collection.createIndex === 'function') {
+      Admin.collection.createIndex({ token: 1 }, { sparse: true }).catch(e => console.warn('Admin token index create failed:', e && e.message ? e.message : e));
+    }
+    if (User && User.collection && typeof User.collection.createIndex === 'function') {
+      User.collection.createIndex({ token: 1 }, { sparse: true }).catch(e => console.warn('User token index create failed:', e && e.message ? e.message : e));
+      User.collection.createIndex({ username: 1 }).catch(e => console.warn('User username index create failed:', e && e.message ? e.message : e));
+    }
+  } catch (e) {
+    console.warn('Index creation block error:', e && e.message ? e.message : e);
+  }
+})();
+
 // ========== Cloudinary Config ==========
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'dycytqdfj',
@@ -40,6 +56,12 @@ function asyncHandler(fn) {
             res.status(500).json({ success: false, message: e.message || 'Server error' });
         });
     };
+}
+
+// ---------- Helper: escape RegExp for user search ----------
+function escapeRegExp(s) {
+  if (!s) return '';
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // ========== Cloudinary product fetch helpers for admin ==========
@@ -385,12 +407,18 @@ router.put('/user/:username', asyncHandler(async (req, res) => {
 
 // ===================== DASHBOARD ANALYTICS API ===================== //
 router.get('/total-users', asyncHandler(async (_, res) => {
-    const count = await User.countDocuments();
+    // Use estimatedDocumentCount for a fast approximate count. If you need exact, switch to countDocuments().
+    const count = await User.estimatedDocumentCount();
     res.json({ count });
 }));
 router.get('/total-balance', asyncHandler(async (_, res) => {
-    const users = await User.find({}, { balance: 1 }).lean();
-    const total = users.reduce((sum, u) => sum + (typeof u.balance === 'number' ? u.balance : 0), 0);
+    // Use aggregation so MongoDB sums balances efficiently without transferring all documents
+    const result = await User.aggregate([
+      { $match: { balance: { $exists: true } } },
+      { $group: { _id: null, total: { $sum: { $ifNull: ['$balance', 0] } } } }
+    ]).allowDiskUse(false).exec();
+
+    const total = result && result[0] && result[0].total ? Number(result[0].total) : 0;
     res.json({ total: total.toFixed(2) });
 }));
 router.get('/active-tasks', asyncHandler(async (_, res) => {
@@ -591,10 +619,56 @@ router.post('/settings', asyncHandler(async (req, res) => {
 }));
 
 // ===================== USERS API (RESTful) ===================== //
-router.get('/users', asyncHandler(async (_, res) => {
-    const users = await User.find({}).lean();
+/*
+  GET /admin/users
+    Optional query params:
+      - page (default 1)
+      - limit (default 50, max 200)
+      - sort (default -createdAt)
+      - fields (comma-separated projection e.g. username,phone,balance)
+      - q (search string for username or phone)
+  Returns:
+    { total, page, limit, users: [...] }
+*/
+router.get('/users', asyncHandler(async (req, res) => {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const skip = (page - 1) * limit;
+    const sort = req.query.sort || '-createdAt';
+    const fields = req.query.fields ? req.query.fields.split(',').join(' ') : 'username phone balance status createdAt';
+
+    const q = req.query.q ? String(req.query.q).trim() : null;
+    const filter = {};
+    if (q) {
+      const regex = new RegExp(escapeRegExp(q), 'i');
+      filter.$or = [
+        { username: regex },
+        { phone: regex }
+      ];
+    }
+
+    const [total, users] = await Promise.all([
+      User.countDocuments(filter),
+      User.find(filter).select(fields).sort(sort).skip(skip).limit(limit).lean()
+    ]);
+
+    res.json({ total, page, limit, users });
+}));
+
+// Lightweight search endpoint for appbar autocomplete and incremental search
+// GET /admin/users/search?q=foo&limit=20
+router.get('/users/search', asyncHandler(async (req, res) => {
+    const q = String(req.query.q || '').trim();
+    if (!q) return res.json([]);
+    const limit = Math.min(50, Math.max(5, Number(req.query.limit) || 20));
+    const regex = new RegExp(`^${escapeRegExp(q)}`, 'i');
+    const users = await User.find({ $or: [{ username: regex }, { phone: regex }] })
+      .select('username phone balance')
+      .limit(limit)
+      .lean();
     res.json(users);
 }));
+
 router.post('/users', asyncHandler(async (req, res) => {
     // Debug log incoming payload for visibility
     try { console.log('POST /admin/users payload:', JSON.stringify(req.body).slice(0, 2000)); } catch (e) { /* ignore */ }
