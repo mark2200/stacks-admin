@@ -488,6 +488,7 @@
 </head>
 <body>
   <script>
+    // token check at top of page - keep this as-is
     const token = localStorage.getItem("adminToken");
     if (!token) {
       alert("Access denied. Please login.");
@@ -698,8 +699,8 @@
       syncIframeDarkMode();
       showDashboardOverview();
       renderCharts();
-      // preload users for appbar search autocomplete
-      fetchAllUsersForAppbar();
+      // NOTE: removed full prefetch of all users to avoid loading large datasets on startup.
+      // Appbar search now performs on-demand server-side queries with debounce.
     });
     document.body.addEventListener('classChange', syncIframeDarkMode);
     document.getElementById('mainFrame').addEventListener('load', syncIframeDarkMode);
@@ -1002,43 +1003,86 @@
     /* ===== end Add User modal wiring ===== */
 
     //
-    // Appbar user search: fetch users once and show autocomplete; selecting opens users.html#user=<username>
+    // Appbar user search: on-demand server-side search with debounce (replaces prefetch of entire user list)
     //
-    let _appbarUsersCache = [];
+    let _appbarSearchTimer = null;
+    let _appbarQueryCache = new Map(); // small per-query cache to reduce identical requests
+    const APPBAR_DEBOUNCE_MS = 250;
 
-    async function fetchAllUsersForAppbar() {
+    async function doSearch(q) {
+      if (!q || !q.trim()) {
+        renderAppbarAutocomplete([]);
+        return [];
+      }
+      q = q.trim();
+      // Return cached results when available
+      if (_appbarQueryCache.has(q)) {
+        const cached = _appbarQueryCache.get(q);
+        renderAppbarAutocomplete(cached);
+        return cached;
+      }
+
+      const headers = { 'x-admin-token': localStorage.getItem('adminToken') || '' };
       try {
-        const res = await fetch('/admin/users', {
-          headers: { 'x-admin-token': localStorage.getItem('adminToken') }
-        });
-        if (res.ok) {
-          _appbarUsersCache = await res.json();
-        } else {
-          _appbarUsersCache = [];
+        const res = await fetch('/admin/users/search?q=' + encodeURIComponent(q) + '&limit=30', { headers });
+        if (!res.ok) {
+          renderAppbarAutocomplete([]);
+          return [];
+        }
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          _appbarQueryCache.set(q, data);
+          // Keep cache small (max 50 entries)
+          if (_appbarQueryCache.size > 50) {
+            const firstKey = _appbarQueryCache.keys().next().value;
+            _appbarQueryCache.delete(firstKey);
+          }
+          renderAppbarAutocomplete(data);
+          return data;
         }
       } catch (e) {
-        _appbarUsersCache = [];
+        console.warn('Appbar search failed', e);
       }
+      renderAppbarAutocomplete([]);
+      return [];
     }
 
     function onAppbarUserInput() {
-      const q = document.getElementById('appbarUserSearch').value.trim().toLowerCase();
+      const q = document.getElementById('appbarUserSearch').value.trim();
       const list = document.getElementById('appbarAutocomplete');
       if (!q) {
         list.style.display = 'none';
         return;
       }
-      const matches = _appbarUsersCache.filter(u => {
-        if (!u || !u.username) return false;
-        return u.username.toLowerCase().includes(q) || (u.phone && String(u.phone).includes(q));
-      }).slice(0, 30);
-      renderAppbarAutocomplete(matches);
+      if (_appbarSearchTimer) clearTimeout(_appbarSearchTimer);
+      _appbarSearchTimer = setTimeout(() => doSearch(q), APPBAR_DEBOUNCE_MS);
+    }
+
+    // Make keydown handler async so we can await a quick search on Enter
+    async function onAppbarUserKeyDown(e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const q = document.getElementById('appbarUserSearch').value.trim();
+        if (!q) return;
+        // Ask server for matches and open exact match if present
+        const results = await doSearch(q);
+        const exact = results && results.find(u => u.username === q);
+        if (exact) {
+          selectUserFromAppbar(exact.username);
+          return;
+        }
+        // fallback: open users page with hash so users.html can read hash and open drawer
+        showIframePage('users.html#user=' + encodeURIComponent(q));
+        document.getElementById('appbarAutocomplete').style.display = 'none';
+      } else if (e.key === 'Escape') {
+        document.getElementById('appbarAutocomplete').style.display = 'none';
+      }
     }
 
     function renderAppbarAutocomplete(matches) {
       const list = document.getElementById('appbarAutocomplete');
       list.innerHTML = '';
-      if (!matches.length) {
+      if (!Array.isArray(matches) || !matches.length) {
         list.style.display = 'none';
         return;
       }
@@ -1056,25 +1100,6 @@
         list.appendChild(div);
       });
       list.style.display = 'block';
-    }
-
-    function onAppbarUserKeyDown(e) {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        const q = document.getElementById('appbarUserSearch').value.trim();
-        if (!q) return;
-        // If exact match exists, open that user; otherwise open users page with hash to search there.
-        const exact = _appbarUsersCache.find(u => u.username === q);
-        if (exact) {
-          selectUserFromAppbar(exact.username);
-          return;
-        }
-        // fallback: open users page with hash so users.html can read hash and open drawer
-        showIframePage('users.html#user=' + encodeURIComponent(q));
-        document.getElementById('appbarAutocomplete').style.display = 'none';
-      } else if (e.key === 'Escape') {
-        document.getElementById('appbarAutocomplete').style.display = 'none';
-      }
     }
 
     function selectUserFromAppbar(username) {
