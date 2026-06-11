@@ -343,6 +343,30 @@ function getUKHour() {
   }
 }
 
+// NEW: get current date string (YYYY-MM-DD) in America/New_York timezone
+function getNYDateKey() {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'America/New_York',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(new Date());
+    const year = parts.find(p => p.type === 'year')?.value;
+    const month = parts.find(p => p.type === 'month')?.value;
+    const day = parts.find(p => p.type === 'day')?.value;
+    if (year && month && day) {
+      return `${year}-${month}-${day}`;
+    }
+    // fallback
+    const now = new Date();
+    const offsetDate = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    return offsetDate.toISOString().slice(0,10);
+  } catch (err) {
+    return new Date().toISOString().slice(0,10);
+  }
+}
+
 async function getOrCreateSettings() {
   let settings = await Setting.findOne({});
   if (!settings) {
@@ -612,7 +636,7 @@ router.get('/user-profile', verifyUserToken, async (req, res) => {
         const userSet = (typeof dbUser.currentSet === 'number' && !isNaN(dbUser.currentSet)) ? dbUser.currentSet : 1;
 
         // Midnight commission reset safety (perform efficient update rather than saving whole doc)
-        const todayStr = new Date().toISOString().slice(0, 10);
+        const todayStr = getNYDateKey();
         if (dbUser.lastCommissionReset !== todayStr) {
             try {
                 await User.updateOne(
@@ -665,7 +689,7 @@ router.get('/user-profile', verifyUserToken, async (req, res) => {
                 isAdmin: !!dbUser.isAdmin
             }
         });
-    } catch (err) {
+    } catch (err) {  
         console.error('GET /api/user-profile error:', err && err.message ? err.message : err);
         return res.status(500).json({ success: false, message: 'Failed to load profile' });
     }
@@ -1007,7 +1031,7 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
           const vipInfo = vipRules[user.vipLevel] || vipRules[1];
           const completedCount = await Task.countDocuments({ username: user.username, set: taskSet, status: { $regex: /^completed$/i } });
           if (completedCount >= (vipInfo.tasks || 40)) {
-            const todayKey = getUKDateKey();
+            const todayKey = getNYDateKey();
             // Atomically increment registeredWorkingDays[todayKey], and mark that reset is requested.
             // IMPORTANT: do NOT auto-increment currentSet anymore.
             const updates = {
@@ -1076,7 +1100,7 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
         const taskSet = task.set || 1;
         const completedCount = await Task.countDocuments({ username: user.username, set: taskSet, status: { $regex: /^completed$/i } });
         if (completedCount >= (vipInfo.tasks || 40)) {
-          const todayKey = getUKDateKey();
+          const todayKey = getNYDateKey();
           // Atomically increment registeredWorkingDays[todayKey] and set resetRequested flag.
           // IMPORTANT: do NOT auto-increment currentSet anymore.
           const updates = {
@@ -1229,7 +1253,7 @@ router.patch('/admin/users/:userId/credit_score', async (req, res) => {
 
 // ----------------------- Admin Endpoint: Invalidate All Tokens (NEW) -----------------------
 // Admin can trigger this to permanently invalidate tokens issued before now for all users.
-// Useful to quickly revoke access across all devices (e.g., after compromise).
+// Useful to quickly revoke access across all devices.
 router.post('/admin/invalidate-all-tokens', async (req, res) => {
   const { adminSecret } = req.body;
   const ADMIN_SECRET = 'yoursecretpassword';
