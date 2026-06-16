@@ -1,456 +1,438 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Admin - Combos Management</title>
+  <meta charset="utf-8" />
+  <title>Admin - Combos</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="stylesheet" href="./styles.css" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    .product-grid { display: flex; flex-wrap: wrap; gap: 8px; max-height: 240px; overflow-y: auto; margin-bottom: 8px; }
-    .product-tile {
-      border: 2px solid #eee; border-radius: 6px; width: 68px; cursor: pointer;
-      display: flex; flex-direction: column; align-items: center; padding: 4px;
-      transition: border 0.2s;
+    body { font-family: Inter, Arial, sans-serif; margin: 0; padding: 20px; background:#f7f9fc; color:#111827; }
+    .section-header { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+    .section-header h2 { margin:0; font-size:1.2rem; }
+    .table-responsive { max-height:70vh; overflow:auto; background:#fff; border-radius:8px; padding:8px; border:1px solid #e6eef6; }
+    table { width:100%; border-collapse: collapse; font-size:14px; }
+    th,td { text-align:left; padding:8px 10px; border-bottom:1px solid #f1f5f9; vertical-align:middle; }
+    th { background:#fbfdff; position: sticky; top:0; z-index:1; }
+    .action-btn { border:0; background:transparent; cursor:pointer; padding:6px; }
+    .add-btn, .export-btn { padding:8px 12px; border-radius:8px; border:0; cursor:pointer; }
+    .add-btn { background:#1767c6; color:#fff; }
+    .export-btn { background:#e6eef6; color:#123; }
+    .modal { position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(6,10,20,0.45); z-index:9999; }
+    .modal .panel { width:760px; max-width:96%; background:#fff; border-radius:8px; padding:18px; box-shadow:0 10px 40px rgba(2,6,23,0.12); max-height:92vh; overflow:auto; }
+    .row { display:flex; gap:8px; }
+    .col { flex:1; }
+    .product-grid { display:flex; gap:8px; flex-wrap:wrap; max-height:220px; overflow:auto; margin-top:8px; }
+    .product-tile { width:72px; border:1px solid #eceff6; border-radius:6px; padding:6px; cursor:pointer; text-align:center; background:#fff; }
+    .product-tile.selected { border-color:#1767c6; background:#eaf1fd; }
+    .product-tile img{ width:56px; height:56px; object-fit:cover; display:block; margin:0 auto 6px; }
+    .selected-products-table { width:100%; border-collapse:collapse; margin-top:10px; }
+    .selected-products-table th, .selected-products-table td { padding:6px; border:1px solid #eef4fb; font-size:13px; }
+    .toast { position:fixed; left:50%; transform:translateX(-50%); bottom:30px; background:#1767c6; color:#fff; padding:10px 14px; border-radius:8px; display:none; z-index:99999;}
+    .loading { color:#64748b; font-size:13px; margin-left:8px; }
+    .muted { color:#64748b; font-size:13px; }
+
+    @media (max-width:720px){
+      .row { flex-direction:column; }
+      .product-grid { max-height:140px; }
+      .modal .panel { padding:12px; }
     }
-    .product-tile.selected { border: 2px solid #1976d2; background: #eaf1fd; }
-    .product-tile img { width: 54px; height: 54px; object-fit: contain; }
-    .product-tile span { font-size: 10px; text-align: center; margin-top: 2px; word-break: break-all; }
-    .selected-products-table { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
-    .selected-products-table th, .selected-products-table td { font-size: 12px; padding: 2px 6px; border: 1px solid #ddd; }
-    .selected-products-table th { background: #f5f5f5; }
-    .remove-prod-btn { color: #d23; cursor: pointer; }
-    .selected-products-table input[type="number"] { width: 60px; }
-    .filter-row { display: flex; gap: 8px; margin-bottom: 4px; }
   </style>
 </head>
 <body>
-  <script>
-    // Redirect to login if token missing
-    const token = localStorage.getItem("adminToken");
-    if (!token) {
-      alert("Access denied. Please login.");
-      window.location.href = "/admin-panel/login.html";
-    }
-  </script>
-
-  <div class="main-content" id="mainContent">
-    <main class="dashboard-container">
-      <section class="admin-section">
-        <div class="section-header">
-          <h2>Combos Management</h2>
-          <input type="text" id="searchInput" placeholder="Search by username or trigger task..." oninput="searchCombos()" />
-          <button class="add-btn" onclick="showAddComboModal()"><i class="fa fa-plus"></i> Assign Combo</button>
-          <button class="export-btn" onclick="exportCombosCSV()"><i class="fa fa-download"></i> Export CSV</button>
-        </div>
-        <div class="table-responsive">
-          <table>
-            <thead>
-              <tr>
-                <th><input type="checkbox" id="selectAllCombos" onclick="toggleSelectAllCombos(this)"></th>
-                <th>Combo ID</th>
-                <th>Username</th>
-                <th>Trigger Task #</th>
-                <th>Products</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="combosTable"></tbody>
-          </table>
-        </div>
-        <div class="bulk-actions" id="bulkActions" style="display:none;">
-          <button class="bulk-btn" onclick="bulkDeleteCombos()"><i class="fa fa-trash"></i> Delete Selected</button>
-        </div>
-      </section>
-    </main>
+  <div class="section-header">
+    <h2>Combos Manager</h2>
+    <input id="comboSearchInput" placeholder="Search by username or product…" style="flex:1; padding:8px 10px; border-radius:8px; border:1px solid #e6eef6;" oninput="onComboSearch()" />
+    <button class="add-btn" onclick="openAddComboModal()"><i class="fa fa-plus"></i> New Combo</button>
+    <button class="export-btn" onclick="exportCombosCSV()"><i class="fa fa-download"></i> Export</button>
+    <span id="combosLoading" class="loading" style="display:none">Loading…</span>
   </div>
 
-  <div id="toast" class="toast"></div>
+  <div class="table-responsive">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Username</th>
+          <th>Trigger Task</th>
+          <th>Products</th>
+          <th>Created At</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="combosTable">
+        <!-- rows -->
+      </tbody>
+    </table>
+  </div>
 
-  <!-- Add/Edit Combo Modal -->
+  <div style="margin-top:8px;">
+    <button id="loadMoreCombosBtn" onclick="loadMoreCombos()" style="display:none;padding:8px 12px;border-radius:8px;border:1px solid #e6eef6;background:#fff;cursor:pointer;">Load more</button>
+    <span id="combosCount" class="muted" style="margin-left:12px"></span>
+  </div>
+
+  <!-- Combo Modal -->
   <div class="modal" id="comboModal">
-    <div class="modal-content" style="max-width:520px">
-      <span class="close" onclick="closeComboModal()">&times;</span>
-      <h2 id="comboModalTitle">Assign Combo</h2>
-      <form id="comboForm" autocomplete="off">
-        <input type="text" id="modalUsername" placeholder="Username" required />
-        <input type="number" id="modalTriggerTask" placeholder="Trigger Task Number" min="1" required style="margin-bottom:8px;" />
+    <div class="panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h3 id="comboModalTitle">Create Combo</h3>
+        <button onclick="closeComboModal()" style="border:0;background:transparent;font-size:20px;cursor:pointer">✕</button>
+      </div>
 
-        <label style="font-weight: 500; margin-top:4px; display:block;">Pick Products:</label>
-        <div class="filter-row">
-          <input type="number" id="minPriceInput" placeholder="Min price" style="width:90px;" oninput="onPriceFilterChange()" />
-          <input type="number" id="maxPriceInput" placeholder="Max price" style="width:90px;" oninput="onPriceFilterChange()" />
+      <form id="comboForm">
+        <div class="row">
+          <div class="col">
+            <label>Username</label>
+            <input id="combo_username" required style="width:100%;padding:8px;border-radius:6px;border:1px solid #e6eef6;">
+          </div>
+          <div style="width:170px">
+            <label>Trigger Task #</label>
+            <input id="combo_trigger" type="number" min="1" required style="width:100%;padding:8px;border-radius:6px;border:1px solid #e6eef6;">
+          </div>
         </div>
-        <input type="text" id="productSearch" placeholder="Search products..." style="width:100%;margin-bottom:4px;" oninput="renderProductGrid()" />
-        <div class="product-grid" id="productGrid"></div>
 
-        <label style="font-weight: 500; margin-top:8px; display:block;">Selected Products:</label>
-        <table class="selected-products-table">
-          <thead>
-            <tr>
-              <th>Image</th>
-              <th>Name</th>
-              <th>Price</th>
-              <th>Commission</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="selectedProductsTable"></tbody>
-        </table>
+        <div style="margin-top:10px">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="font-weight:600">Pick Products</div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input id="combo_product_search" placeholder="Search products" style="padding:6px;border-radius:6px;border:1px solid #e6eef6" oninput="renderComboProductGrid()" />
+              <button type="button" onclick="comboFetchCloudinaryProducts()" style="padding:6px;border-radius:6px;border:1px solid #dbeafe;background:#eff6ff;cursor:pointer">Refresh</button>
+            </div>
+          </div>
 
-        <button type="submit" class="add-btn">Save</button>
+          <div class="product-grid" id="comboProductGrid"></div>
+
+          <div style="margin-top:10px;font-weight:600">Selected Products</div>
+          <table class="selected-products-table">
+            <thead>
+              <tr><th>Image</th><th>Name</th><th>Price</th><th>Commission</th><th></th></tr>
+            </thead>
+            <tbody id="comboSelectedTable"></tbody>
+          </table>
+        </div>
+
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+          <button type="button" onclick="closeComboModal()" style="padding:8px 12px;border-radius:8px;border:1px solid #e6eef6;background:#fff;cursor:pointer">Cancel</button>
+          <button type="submit" class="add-btn">Save Combo</button>
+        </div>
       </form>
     </div>
   </div>
 
+  <div id="toast" class="toast"></div>
+
   <script>
-    // --- COMBOS MANAGEMENT WITH RESTful API ---
-    // selectedCombos now stores combo IDs (string) not numeric indices
-    let selectedCombos = new Set();
+    // Basic auth/token check
+    const adminToken = localStorage.getItem('adminToken');
+    if (!adminToken) {
+      alert('Access denied. Please login.');
+      window.location.href = '/admin-panel/login.html';
+    }
+
+    // State
+    let combos = [];
+    let combosPage = 1;
+    const combosPerPage = 80;
+    let combosTotal = 0;
+    let combosLoading = false;
+    let comboSearch = '';
     let editingComboId = null;
-    let allCombos = [];            // full list from server
-    window.displayedCombos = [];   // currently-rendered list (may be filtered)
-    // For modal product selection
-    let selectedProducts = []; // [{name, image, price, commission}]
-    let productsList = [];
-    let lastPriceFilter = {min: "", max: ""};
 
-    async function fetchCombos() {
-      try {
-        const res = await fetch('/admin/combos', {
-          headers: { 'x-admin-token': localStorage.getItem('adminToken') }
-        });
-        if (!res.ok) throw new Error('Unauthorized');
-        allCombos = await res.json();
-        renderCombos(allCombos);
-      } catch (err) {
-        alert("Session expired or unauthorized. Please login again.");
-        logout();
-      }
-    }
-
-    // renderCombos now sets displayedCombos so actions operate against the actual displayed array
-    function renderCombos(combos) {
-      const table = document.getElementById("combosTable");
-      table.innerHTML = "";
-      window.displayedCombos = combos;
-      combos.forEach((combo, idx) => {
-        const comboId = combo.id || combo._id || "";
-        const checked = selectedCombos.has(String(comboId)) ? "checked" : "";
-        const productsHtml = (Array.isArray(combo.products) ? combo.products : []).map(p =>
-          `<img src="${p.image}" alt="" style="width:22px;height:22px;vertical-align:middle;margin-right:2px;"> ${p.name} <span style="color:#555;">[£${p.price} | £${p.commission}]</span>`
-        ).join("<br>");
-        table.innerHTML += `
-          <tr>
-            <td><input type="checkbox" onclick="selectCombo('${comboId}', this)" ${checked}></td>
-            <td>${comboId}</td>
-            <td>${combo.username}</td>
-            <td>${combo.triggerTaskNumber}</td>
-            <td>${productsHtml}</td>
-            <td class="action-icons">
-              <button class="icon-btn" title="Edit" onclick="editCombo('${comboId}')"><i class="fa fa-edit"></i></button>
-              <button class="icon-btn" title="Delete" onclick="deleteCombo('${comboId}')"><i class="fa fa-trash"></i></button>
-            </td>
-          </tr>
-        `;
-      });
-      document.getElementById("bulkActions").style.display = selectedCombos.size > 0 ? "block" : "none";
-    }
-
-    // --- Product Picker Modal Logic (unchanged) ---
-    async function fetchCloudinaryProducts() {
-      const min = document.getElementById("minPriceInput").value;
-      const max = document.getElementById("maxPriceInput").value;
-      let url = "/admin/cloudinary-products";
-      const params = [];
-      if (min) params.push("minPrice=" + encodeURIComponent(min));
-      if (max) params.push("maxPrice=" + encodeURIComponent(max));
-      if (params.length) url += "?" + params.join("&");
-      lastPriceFilter = {min, max};
-      const res = await fetch(url, {
-        headers: { 'x-admin-token': localStorage.getItem('adminToken') }
-      });
-      const data = await res.json();
-      productsList = data.products || [];
-      renderProductGrid();
-    }
-
-    function onPriceFilterChange() {
-      fetchCloudinaryProducts();
-    }
-
-    function renderProductGrid() {
-      const grid = document.getElementById("productGrid");
-      const productSearchTerm = document.getElementById("productSearch").value.trim().toLowerCase();
-      grid.innerHTML = "";
-      let filtered = productsList.filter(p =>
-        p.name.toLowerCase().includes(productSearchTerm) ||
-        (p.price && String(p.price).includes(productSearchTerm))
-      );
-      filtered.forEach((prod) => {
-        const isSelected = selectedProducts.some(sp => sp.image === prod.image);
-        grid.innerHTML += `
-          <div class="product-tile${isSelected ? ' selected' : ''}" onclick="toggleProduct('${prod.image.replace(/'/g,"\\'")}')">
-            <img src="${prod.image}" alt="">
-            <span>${prod.name}<br>£${prod.price}</span>
-          </div>
-        `;
-      });
-    }
-
-    window.toggleProduct = function(image) {
-      const prod = productsList.find(p => p.image === image);
-      const idx = selectedProducts.findIndex(sp => sp.image === image);
-      if (idx >= 0) {
-        selectedProducts.splice(idx,1);
-      } else {
-        selectedProducts.push({...prod, price:prod.price ?? "", commission:""});
-      }
-      renderProductGrid();
-      renderSelectedProductsTable();
-    };
-
-    function renderSelectedProductsTable() {
-      const table = document.getElementById("selectedProductsTable");
-      table.innerHTML = "";
-      selectedProducts.forEach((prod, idx) => {
-        table.innerHTML += `
-          <tr>
-            <td><img src="${prod.image}" style="width:34px;height:34px;"></td>
-            <td>${prod.name}</td>
-            <td>
-              <input type="number" min="0" step="0.01" value="${prod.price ?? ""}" onchange="updateProductField(${idx}, 'price', this.value)" required>
-            </td>
-            <td>
-              <input type="number" min="0" step="0.01" value="${prod.commission ?? ""}" onchange="updateProductField(${idx}, 'commission', this.value)" required>
-            </td>
-            <td>
-              <span class="remove-prod-btn" onclick="removeSelectedProduct(${idx})"><i class="fa fa-times"></i></span>
-            </td>
-          </tr>
-        `;
-      });
-    }
-
-    window.updateProductField = function(idx, field, value) {
-      selectedProducts[idx][field] = value;
-    };
-
-    window.removeSelectedProduct = function(idx) {
-      selectedProducts.splice(idx,1);
-      renderProductGrid();
-      renderSelectedProductsTable();
-    };
-
-    function showAddComboModal() {
-      editingComboId = null;
-      selectedProducts = [];
-      document.getElementById("comboModalTitle").textContent = "Assign Combo";
-      document.getElementById("comboForm").reset();
-      document.getElementById("productSearch").value = "";
-      document.getElementById("minPriceInput").value = "";
-      document.getElementById("maxPriceInput").value = "";
-      fetchCloudinaryProducts();
-      renderSelectedProductsTable();
-      document.getElementById("comboModal").style.display = "block";
-    }
-    function closeComboModal() {
-      document.getElementById("comboModal").style.display = "none";
-    }
-
-    document.getElementById("comboForm").onsubmit = async function(e) {
-      e.preventDefault();
-      const username = document.getElementById("modalUsername").value.trim();
-      const triggerTaskNumber = Number(document.getElementById("modalTriggerTask").value);
-
-      // Validate selected products
-      if (selectedProducts.length === 0) {
-        showToast("Pick at least one product!");
-        return;
-      }
-      for (const prod of selectedProducts) {
-        if (prod.price === "" || prod.commission === "") {
-          showToast("Set price & commission for each product!");
-          return;
-        }
-      }
-
-      const products = selectedProducts.map(({name,image,price,commission}) => ({
-        name, image,
-        price: Number(price), commission: Number(commission)
-      }));
-
-      if (editingComboId) {
-        // Edit by ID
-        await fetch(`/admin/combos/${encodeURIComponent(editingComboId)}`, {
-          method: 'PUT',
-          headers: {
-            "Content-Type": "application/json",
-            "x-admin-token": localStorage.getItem('adminToken')
-          },
-          body: JSON.stringify({ username, triggerTaskNumber, products })
-        });
-        showToast("Combo updated!");
-      } else {
-        // Add
-        await fetch('/admin/combos', {
-          method: 'POST',
-          headers: {
-            "Content-Type": "application/json",
-            "x-admin-token": localStorage.getItem('adminToken')
-          },
-          body: JSON.stringify({ username, triggerTaskNumber, products })
-        });
-        showToast("Combo assigned!");
-      }
-      closeComboModal();
-      fetchCombos();
-    };
-
-    // Edit receives comboId; we find the combo in allCombos then populate modal
-    async function editCombo(comboId) {
-      editingComboId = comboId;
-      const combo = (allCombos.find(c => String(c._id) === String(comboId) || String(c.id) === String(comboId))) || null;
-      if (!combo) {
-        showToast("Combo not found (it may have been removed). Refreshing list...");
-        fetchCombos();
-        return;
-      }
-      document.getElementById("comboModalTitle").textContent = "Edit Combo";
-      document.getElementById("comboForm").reset();
-      document.getElementById("modalUsername").value = combo.username;
-      document.getElementById("modalTriggerTask").value = combo.triggerTaskNumber;
-      selectedProducts = (Array.isArray(combo.products) ? combo.products : []).map(p => ({
-        name: p.name, image: p.image, price: p.price, commission: p.commission
-      }));
-      document.getElementById("productSearch").value = "";
-      document.getElementById("minPriceInput").value = "";
-      document.getElementById("maxPriceInput").value = "";
-      fetchCloudinaryProducts();
-      renderSelectedProductsTable();
-      document.getElementById("comboModal").style.display = "block";
-    }
-
-    // Delete by ID (safer): calls backend delete and refreshes
-    async function deleteCombo(comboId) {
-      if (!comboId) return showToast("Invalid combo id");
-      if (!confirm("Are you sure you want to delete this combo?")) return;
-      const res = await fetch(`/admin/combos/${encodeURIComponent(comboId)}`, {
-        method: 'DELETE',
-        headers: { "x-admin-token": localStorage.getItem('adminToken') }
-      });
-      if (res.ok) {
-        showToast("Combo deleted.");
-      } else {
-        const data = await res.json().catch(()=>({}));
-        showToast("Failed to delete combo: " + (data.message || res.statusText));
-      }
-      fetchCombos();
-    }
-
-    async function bulkDeleteCombos() {
-      if (!selectedCombos.size) return;
-      if (!confirm("Are you sure you want to delete selected combos?")) return;
-      // iterate IDs
-      for (let comboId of Array.from(selectedCombos)) {
-        if (!comboId) continue;
-        await fetch(`/admin/combos/${encodeURIComponent(comboId)}`, {
-          method: 'DELETE',
-          headers: { "x-admin-token": localStorage.getItem('adminToken') }
-        });
-      }
-      selectedCombos.clear();
-      showToast("Selected combos deleted.");
-      fetchCombos();
-    }
-
-    function exportCombosCSV() {
-      const csv = [
-        ["Combo ID", "Username", "Trigger Task #", "Products"],
-        ...allCombos.map(c => [
-          c.id || c._id, c.username, c.triggerTaskNumber,
-          (Array.isArray(c.products) ? c.products.map(p=>`${p.name} (£${p.price}/£${p.commission})`).join('; ') : "")
-        ])
-      ].map(row => row.map(String).map(s=>`"${s.replace(/"/g,'""')}"`).join(",")).join("\n");
-      const blob = new Blob([csv], { type: "text/csv" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "combos.csv";
-      a.click();
-      URL.revokeObjectURL(url);
-      showToast("Exported to CSV!");
-    }
-
-    // selectCombo now stores a combo ID in the Set rather than an index
-    function selectCombo(comboId, checkbox) {
-      if (!comboId) return;
-      if (checkbox.checked) selectedCombos.add(String(comboId));
-      else selectedCombos.delete(String(comboId));
-      renderCombos(window.displayedCombos || allCombos);
-    }
-    window.selectCombo = selectCombo;
-
-    function toggleSelectAllCombos(master) {
-      if (master.checked) {
-        // add every displayed combo id
-        (window.displayedCombos || allCombos).forEach(c => {
-          const id = c.id || c._id;
-          if (id) selectedCombos.add(String(id));
-        });
-      } else {
-        selectedCombos.clear();
-      }
-      renderCombos(window.displayedCombos || allCombos);
-    }
-    window.toggleSelectAllCombos = toggleSelectAllCombos;
-
-    function searchCombos() {
-      const term = document.getElementById('searchInput').value.trim().toLowerCase();
-      const filtered = allCombos.filter(combo =>
-        (combo.username && combo.username.toLowerCase().includes(term)) ||
-        (combo.triggerTaskNumber && (combo.triggerTaskNumber + '').includes(term))
-      );
-      renderCombos(filtered);
-    }
-    window.searchCombos = searchCombos;
+    // Cloudinary products cached for the modal
+    let cloudProducts = [];
+    let comboSelected = []; // {name,image,price,commission}
 
     function showToast(msg) {
-      const toast = document.getElementById("toast");
-      toast.textContent = msg;
-      toast.className = "toast show";
-      setTimeout(() => { toast.className = "toast"; }, 3000);
-    }
-    function logout() {
-      localStorage.removeItem("adminToken");
-      window.location.href = "/admin-panel/login.html";
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.style.display = 'block';
+      setTimeout(()=> t.style.display = 'none', 3000);
     }
 
-    window.onclick = function(event) {
-      if (event.target.classList.contains('modal')) {
-        event.target.style.display = "none";
+    function setCombosLoading(on) {
+      combosLoading = !!on;
+      document.getElementById('combosLoading').style.display = on ? 'inline' : 'none';
+    }
+
+    // Fetch combos (paginated, server-side)
+    async function fetchCombos(page=1, append=false) {
+      if (combosLoading) return;
+      setCombosLoading(true);
+      try {
+        let url = `/admin/combos?page=${page}&limit=${combosPerPage}`;
+        if (comboSearch) url += `&q=${encodeURIComponent(comboSearch)}`;
+        const res = await fetch(url, { headers: { 'x-admin-token': adminToken }});
+        if (!res.ok) {
+          if (res.status === 403) { alert('Session expired'); logout(); }
+          throw new Error('Failed to fetch combos');
+        }
+        const data = await res.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        const total = typeof data.total === 'number' ? data.total : items.length;
+        if (append) {
+          combos = combos.concat(items);
+          combosPage = page;
+        } else {
+          combos = items;
+          combosPage = page;
+        }
+        combosTotal = total;
+        renderCombos();
+      } catch (err) {
+        console.error(err);
+        showToast('Error loading combos');
+      } finally {
+        setCombosLoading(false);
       }
     }
 
-    // Initial load
-    fetchCombos();
-  </script>
-<script>
-window.addEventListener("message", function(event) {
-  if (event.data && event.data.type === "setDarkMode") {
-    if (event.data.enable) {
-      document.body.classList.add("dark");
-      document.documentElement.classList.add("dark");
-    } else {
-      document.body.classList.remove("dark");
-      document.documentElement.classList.remove("dark");
+    function renderCombos() {
+      const tbody = document.getElementById('combosTable');
+      tbody.innerHTML = '';
+      combos.forEach(c => {
+        const id = c._id || c.id || '';
+        const productsHtml = (Array.isArray(c.products) ? c.products : []).slice(0,3).map(p => `<div style="display:flex;gap:8px;align-items:center"><img src="${escapeHtml(p.image||'')}" style="width:36px;height:36px;object-fit:cover;border-radius:6px"/><div style="font-size:13px">${escapeHtml(p.name||'')}</div></div>`).join('');
+        const created = c.createdAt ? new Date(c.createdAt).toLocaleString() : (c._createdAt ? new Date(c._createdAt).toLocaleString() : '');
+        tbody.innerHTML += `<tr>
+          <td style="width:14%">${id}</td>
+          <td style="width:14%">${escapeHtml(c.username||'')}</td>
+          <td style="width:12%">${escapeHtml(String(c.triggerTaskNumber||''))}</td>
+          <td style="width:40%">${productsHtml}</td>
+          <td style="width:12%">${escapeHtml(created)}</td>
+          <td style="width:8%">
+            <button class="action-btn" title="Edit" onclick="openEditCombo('${id}')"><i class="fa fa-edit"></i></button>
+            <button class="action-btn" title="Delete" onclick="deleteCombo('${id}')"><i class="fa fa-trash"></i></button>
+          </td>
+        </tr>`;
+      });
+
+      const loadBtn = document.getElementById('loadMoreCombosBtn');
+      if (combos.length < (combosTotal || 0)) {
+        loadBtn.style.display = 'inline-block';
+      } else {
+        loadBtn.style.display = 'none';
+      }
+      document.getElementById('combosCount').textContent = `${combos.length} of ${combosTotal || '-'} combos`;
     }
-  }
-});
-if (localStorage.getItem("adminDarkMode") === "true") {
-  document.body.classList.add("dark");
-  document.documentElement.classList.add("dark");
-}
-</script>
+
+    function escapeHtml(s=''){ return String(s).replace(/[&<>"']/g, (m)=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m])); }
+
+    function loadMoreCombos() {
+      if (combosLoading) return;
+      fetchCombos(combosPage + 1, true);
+    }
+
+    function onComboSearch() {
+      comboSearch = document.getElementById('comboSearchInput').value.trim();
+      // debounce quick
+      if (this._searchTimer) clearTimeout(this._searchTimer);
+      this._searchTimer = setTimeout(()=> fetchCombos(1, false), 220);
+    }
+
+    // Open / close modal
+    function openAddComboModal() {
+      editingComboId = null;
+      comboSelected = [];
+      cloudProducts = [];
+      document.getElementById('comboForm').reset();
+      document.getElementById('comboModalTitle').textContent = 'Create Combo';
+      document.getElementById('comboModal').style.display = 'flex';
+      renderComboProductGrid();
+      renderSelectedTable();
+      comboFetchCloudinaryProducts();
+    }
+    function closeComboModal() {
+      document.getElementById('comboModal').style.display = 'none';
+      // restore combo form handler if it was swapped
+      document.getElementById('comboForm').onsubmit = comboFormSubmitHandler;
+    }
+
+    // Cloudinary product fetch
+    async function comboFetchCloudinaryProducts() {
+      const min = document.getElementById('combo_minPrice') ? document.getElementById('combo_minPrice').value : '';
+      let url = '/admin/cloudinary-products';
+      // allow simple pagination/params later
+      try {
+        const res = await fetch(url, { headers: { 'x-admin-token': adminToken }});
+        if (!res.ok) throw new Error('failed');
+        const data = await res.json();
+        cloudProducts = data.products || [];
+        renderComboProductGrid();
+      } catch (err) {
+        console.warn('Failed to fetch cloud products', err);
+        cloudProducts = [];
+        renderComboProductGrid();
+      }
+    }
+
+    function renderComboProductGrid() {
+      const grid = document.getElementById('comboProductGrid');
+      const term = (document.getElementById('combo_product_search').value || '').toLowerCase().trim();
+      grid.innerHTML = '';
+      const filtered = cloudProducts.filter(p => {
+        if (!p) return false;
+        const name = (p.name || '').toString().toLowerCase();
+        if (!term) return true;
+        return name.includes(term) || String(p.price||'').includes(term);
+      }).slice(0, 200);
+      filtered.forEach(prod => {
+        const isSel = comboSelected.some(s => s.image === prod.image);
+        grid.innerHTML += `<div class="product-tile ${isSel ? 'selected' : ''}" onclick="toggleComboProduct('${escapeHtml(prod.image||'')}')">
+          <img src="${escapeHtml(prod.image||'')}" alt=""/>
+          <div style="font-size:12px;line-height:1.1">${escapeHtml((prod.name||'').slice(0,28))}</div>
+          <div style="font-size:11px;color:#64748b">£${Number(prod.price||0).toFixed(2)}</div>
+        </div>`;
+      });
+    }
+
+    function toggleComboProduct(image) {
+      const prod = cloudProducts.find(p => p.image === image);
+      if (!prod) return;
+      const idx = comboSelected.findIndex(s => s.image === image);
+      if (idx >= 0) comboSelected.splice(idx,1);
+      else comboSelected.push({ name: prod.name||'', image: prod.image||'', price: Number(prod.price||0), commission: 0 });
+      renderComboProductGrid();
+      renderSelectedTable();
+    }
+
+    function renderSelectedTable() {
+      const tb = document.getElementById('comboSelectedTable');
+      tb.innerHTML = '';
+      comboSelected.forEach((p,i) => {
+        tb.innerHTML += `<tr>
+          <td style="width:56px"><img src="${escapeHtml(p.image||'')}" style="width:48px;height:48px;object-fit:cover;border-radius:6px"/></td>
+          <td>${escapeHtml(p.name||'')}</td>
+          <td style="width:120px"><input type="number" min="0" step="0.01" value="${Number(p.price||0).toFixed(2)}" onchange="updateSelectedProduct(${i}, 'price', this.value)" style="width:100%;padding:6px;border-radius:6px;border:1px solid #eef4fb"/></td>
+          <td style="width:120px"><input type="number" min="0" step="0.01" value="${Number(p.commission||0).toFixed(2)}" onchange="updateSelectedProduct(${i}, 'commission', this.value)" style="width:100%;padding:6px;border-radius:6px;border:1px solid #eef4fb"/></td>
+          <td style="width:36px"><button type="button" onclick="removeSelected(${i})" style="border:0;background:transparent;cursor:pointer;color:#c02626"><i class="fa fa-times"></i></button></td>
+        </tr>`;
+      });
+    }
+    function updateSelectedProduct(i, field, value) {
+      comboSelected[i][field] = Number(value);
+    }
+    function removeSelected(i) {
+      comboSelected.splice(i,1);
+      renderComboProductGrid();
+      renderSelectedTable();
+    }
+
+    // Combo create/update handling
+    async function submitCreateCombo(payload) {
+      const res = await fetch('/admin/combos', {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json', 'x-admin-token': adminToken },
+        body: JSON.stringify(payload)
+      });
+      return res;
+    }
+    async function submitUpdateCombo(id, payload) {
+      const res = await fetch(`/admin/combos/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type':'application/json', 'x-admin-token': adminToken },
+        body: JSON.stringify(payload)
+      });
+      return res;
+    }
+
+    // Bind form submit
+    const comboFormSubmitHandler = document.getElementById('comboForm').onsubmit;
+    document.getElementById('comboForm').onsubmit = async function(e) {
+      e.preventDefault();
+      const username = document.getElementById('combo_username').value.trim();
+      const trigger = Number(document.getElementById('combo_trigger').value);
+      if (!username || !trigger) { showToast('Username and trigger required'); return; }
+      if (!comboSelected.length) { showToast('Pick at least one product'); return; }
+
+      const products = comboSelected.map(p => ({ name: p.name, image: p.image, price: Number(p.price||0), commission: Number(p.commission||0) }));
+      const payload = { username, triggerTaskNumber: trigger, products };
+
+      try {
+        let res;
+        if (editingComboId) {
+          res = await submitUpdateCombo(editingComboId, payload);
+        } else {
+          res = await submitCreateCombo(payload);
+        }
+        const data = await res.json().catch(()=>({}));
+        if (!res.ok) {
+          showToast('Save failed: ' + (data && data.message ? data.message : res.statusText));
+          return;
+        }
+        showToast(editingComboId ? 'Combo updated' : 'Combo created');
+        closeComboModal();
+        // refresh combos
+        fetchCombos(1, false);
+      } catch (err) {
+        console.error('combo save error', err);
+        showToast('Network or server error saving combo');
+      }
+    };
+
+    // Edit combo
+    async function openEditCombo(id) {
+      try {
+        // fetch combo by id via combos listing or /admin/combos/:id (we have GET /combos/:id implemented)
+        const res = await fetch(`/admin/combos/${encodeURIComponent(id)}`, { headers: { 'x-admin-token': adminToken }});
+        if (!res.ok) throw new Error('Failed to load combo');
+        const data = await res.json();
+        const combo = (data && data.combo) ? data.combo : null;
+        if (!combo) { showToast('Combo not found'); return; }
+
+        editingComboId = id;
+        document.getElementById('comboModalTitle').textContent = 'Edit Combo';
+        document.getElementById('combo_username').value = combo.username || '';
+        document.getElementById('combo_trigger').value = combo.triggerTaskNumber || '';
+        comboSelected = (Array.isArray(combo.products) ? combo.products.map(p => ({ name: p.name, image: p.image, price: Number(p.price||0), commission: Number(p.commission||0) })) : []);
+        document.getElementById('comboModal').style.display = 'flex';
+        renderSelectedTable();
+        // ensure products list is fetched to allow adding more
+        comboFetchCloudinaryProducts();
+      } catch (err) {
+        console.error('openEditCombo error', err);
+        showToast('Failed to load combo for editing');
+      }
+    }
+
+    // Delete combo
+    async function deleteCombo(id) {
+      if (!confirm('Delete this combo?')) return;
+      try {
+        const res = await fetch(`/admin/combos/${encodeURIComponent(id)}`, { method:'DELETE', headers:{ 'x-admin-token': adminToken }});
+        if (!res.ok) {
+          const data = await res.json().catch(()=>({}));
+          throw new Error(data && data.message ? data.message : 'Delete failed');
+        }
+        showToast('Combo deleted');
+        // refresh
+        fetchCombos(1, false);
+      } catch (err) {
+        console.error(err);
+        showToast('Failed to delete combo');
+      }
+    }
+
+    // Export CSV (current loaded combos only)
+    function exportCombosCSV() {
+      const rows = combos.map(c => {
+        const prodStr = (Array.isArray(c.products) ? c.products : []).map(p => `${p.name||''}:${p.price||''}`).join('|');
+        return [c._id || '', c.username || '', c.triggerTaskNumber || '', prodStr || '', c.createdAt || ''];
+      });
+      const header = ['ID','Username','TriggerTask','Products','CreatedAt'];
+      const csv = [header, ...rows].map(r => r.map(s=>`"${String(s||'').replace(/"/g,'""')}"`).join(',')).join('\n');
+      const blob = new Blob([csv], { type:'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'combos.csv'; a.click(); URL.revokeObjectURL(url);
+      showToast('Exported combos.csv');
+    }
+
+    function logout() {
+      localStorage.removeItem('adminToken');
+      window.location.href = '/admin-panel/login.html';
+    }
+
+    // Startup
+    fetchCombos(1, false);
+  </script>
 </body>
 </html>
