@@ -1,9 +1,18 @@
+// index.js
+// Entry point for the admin backend.
+// Updated to handle optional `compression` module gracefully so deploys don't fail when it's missing.
+
+require("dotenv").config(); // load env early
+
+const mongoose = require("mongoose");
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const cron = require("node-cron");
+
 // ==========================
 // MONGODB CONNECTION SETUP
 // ==========================
-require("dotenv").config(); // load env early so process.env is available before connecting
-
-const mongoose = require("mongoose");
 
 // Prefer environment variable for URI; fall back to the existing literal (kept for compatibility)
 const mongoURI =
@@ -34,34 +43,19 @@ mongoose
   })
   .catch((err) => console.error("❌ MongoDB connection error:", err));
 
-const express = require("express");
-const cors = require("cors");
-const path = require("path");
-
 // ===============================
-// 🌩️ Load ENV Variables
+// Express app + middleware
 // ===============================
-require("dotenv").config();
-
 const app = express();
 
-// ===============================
-// PERFORMANCE: compression & timing
-// ===============================
-const compression = require("compression");
-// Enable GZIP/deflate for responses (reduces large JSON payload transfer time)
-app.use(compression());
-
-// Lightweight request timing logger to help spot slow endpoints
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on("finish", () => {
-    const ms = Date.now() - start;
-    const ip = req.ip || (req.headers['x-forwarded-for'] || req.connection.remoteAddress);
-    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms - ${ip}`);
-  });
-  next();
-});
+// compression is optional - try to enable it if installed, but don't crash if it's missing
+try {
+  const compression = require("compression");
+  app.use(compression());
+  console.log("✅ compression enabled");
+} catch (e) {
+  console.warn("⚠️ compression module not found — continuing without response compression");
+}
 
 // ===============================
 // 🩺 Health Check
@@ -182,15 +176,13 @@ app.use((err, req, res, next) => {
   res.status(500).json({
     success: false,
     message: "Internal server error",
-    error: err.message,
+    error: err && err.message ? err.message : String(err),
   });
 });
 
 // =======================================
 // 🕛 Midnight Commission Reset
 // =======================================
-const cron = require("node-cron");
-
 function getTodayDateString() {
   return new Date().toISOString().slice(0, 10);
 }
