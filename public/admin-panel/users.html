@@ -1364,7 +1364,70 @@
     // save original handler to restore after edit
     const comboFormSubmitHandler = document.getElementById("comboForm").onsubmit;
 
+    // --- Robust delete: try a list of common endpoints/patterns until success ---
     async function deleteComboInDetail(comboId) {
+      if (!confirm("Delete this combo?")) return;
+
+      const attempts = [
+        { method: 'DELETE', url: `/admin/combos/${encodeURIComponent(comboId)}` },
+        { method: 'DELETE', url: `/admin/combos`, body: { id: comboId } },
+        { method: 'POST',   url: `/admin/combos/delete`, body: { id: comboId } },
+        { method: 'DELETE', url: `/admin/remove-combo/${encodeURIComponent(comboId)}` },
+        { method: 'POST',   url: `/admin/remove-combo`, body: { id: comboId } },
+        { method: 'DELETE', url: `/admin/assign-combo/${encodeURIComponent(comboId)}` },
+        { method: 'POST',   url: `/admin/assign-combo/delete`, body: { id: comboId } }
+      ];
+
+      let lastError = null;
+      for (const a of attempts) {
+        try {
+          const opts = { method: a.method, headers: { 'x-admin-token': localStorage.getItem('adminToken') } };
+          if (a.body) {
+            opts.headers['Content-Type'] = 'application/json';
+            opts.body = JSON.stringify(a.body);
+          }
+          const res = await fetch(a.url, opts);
+
+          // auth failure -> stop and logout
+          if (res.status === 401 || res.status === 403) {
+            showToast('Session expired. Redirecting to login...');
+            setTimeout(() => { logout(); }, 600);
+            return;
+          }
+
+          // If resource not found, try next attempt
+          if (res.status === 404) {
+            console.warn('Delete attempt returned 404 for', a.url);
+            lastError = { url: a.url, status: 404 };
+            continue;
+          }
+
+          // For other non-ok statuses, capture message and try next (unless it's a client error indicating bad request)
+          if (!res.ok) {
+            const bodyText = await res.text().catch(()=>null);
+            console.warn('Delete attempt failed', a.url, res.status, bodyText);
+            lastError = { url: a.url, status: res.status, body: bodyText };
+            // If 405 Method Not Allowed, try next
+            continue;
+          }
+
+          // success
+          showToast('Combo deleted.');
+          await loadCombosForDetail(window._currentDetailUser);
+          return;
+        } catch (err) {
+          console.error('Delete attempt error for', a.url, err);
+          lastError = { url: a.url, error: String(err) };
+          continue;
+        }
+      }
+
+      console.error('All delete attempts failed', lastError);
+      showToast('Failed to delete combo (see console).');
+    }
+
+    async function deleteComboInDetail_old(comboId) {
+      // kept for reference — original, simple delete
       if (!confirm("Delete this combo?")) return;
       try {
         const res = await fetch(`/admin/combos/${encodeURIComponent(comboId)}`, {
@@ -1377,85 +1440,6 @@
       } catch (err) {
         console.error(err);
         showToast("Failed to delete combo");
-      }
-    }
-
-    // --- Deposits: show only admin add-balance history (use paginated transactions) ---
-    async function fetchUserDepositsCount(username) {
-      try {
-        const res = await fetch(`/admin/transactions?username=${encodeURIComponent(username)}&type=admin_add_balance&page=1&limit=1`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
-        if (!res.ok) return 0;
-        const data = await res.json();
-        return typeof data.total === 'number' ? data.total : 0;
-      } catch { return 0; }
-    }
-
-    async function loadDepositsForDetail(username) {
-      const el = document.getElementById('detailDepositsList');
-      el.innerHTML = '<li class="muted">Loading deposits…</li>';
-      try {
-        const res = await fetch(`/admin/transactions?username=${encodeURIComponent(username)}&type=admin_add_balance&page=1&limit=200`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
-        if (!res.ok) throw new Error('Failed');
-        const data = await res.json();
-        const items = Array.isArray(data.items) ? data.items : [];
-        items.sort((a,b) => new Date(b.createdAt || b.date || 0) - new Date(a.createdAt || a.date || 0));
-        if (!items.length) {
-          el.innerHTML = '<li class="muted">No admin balance actions found</li>';
-          return;
-        }
-        el.innerHTML = items.map(d => {
-          const amount = Number(d.amount || d.value || 0).toFixed(2);
-          const date = d.createdAt ? new Date(d.createdAt).toLocaleString() : (d.date ? new Date(d.date).toLocaleString() : '');
-          return `<li><div><strong>$${amount}</strong> — <span class="muted">${date}</span></div></li>`;
-        }).join('');
-      } catch (err) {
-        console.error(err);
-        el.innerHTML = '<li class="muted">Failed to load deposits</li>';
-      }
-    }
-
-    async function fetchUserWithdrawalsCount(username) {
-      try {
-        const res = await fetch(`/admin/withdrawals?username=${encodeURIComponent(username)}&page=1&limit=1`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
-        if (!res.ok) return 0;
-        const data = await res.json();
-        return typeof data.total === 'number' ? data.total : 0;
-      } catch { return 0; }
-    }
-
-    async function loadWithdrawalsForDetail(username) {
-      const el = document.getElementById('detailWithdrawalsList');
-      el.innerHTML = '<li class="muted">Loading withdrawals…</li>';
-      try {
-        const res = await fetch(`/admin/withdrawals?username=${encodeURIComponent(username)}&page=1&limit=200`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
-        if (!res.ok) throw new Error('Failed');
-        const data = await res.json();
-        const items = Array.isArray(data.items) ? data.items : [];
-        items.sort((a,b) => new Date(b.createdAt || b.requestedAt || 0) - new Date(a.createdAt || a.requestedAt || 0));
-        if (!items.length) {
-          el.innerHTML = '<li class="muted">No withdrawals</li>';
-          return;
-        }
-        el.innerHTML = items.map((w, idx) => {
-          const amount = Number(w.amount||0).toFixed(2);
-          const status = w.status || 'Pending';
-          const id = w._id || w.id || w.transactionId || idx;
-          const date = w.createdAt ? new Date(w.createdAt).toLocaleString() : (w.requestedAt ? new Date(w.requestedAt).toLocaleString() : '');
-          return `<li id="wdl-${escapeHtml(String(id))}">
-            <div style="flex:1">
-              <div><strong>$${amount}</strong> — <span class="muted">${date}</span></div>
-              <div class="muted">${escapeHtml(String(w.method || ''))}</div>
-            </div>
-            <div style="display:flex;gap:6px;align-items:center">
-              <span class="status-badge ${status.toLowerCase().includes('pending') ? 'status-danger' : (status.toLowerCase().includes('approved')||status.toLowerCase().includes('completed') ? 'status-active' : 'status-suspended')}">${status}</span>
-              <button class="action-btn" onclick="approveWithdrawalInDetail('${escapeHtml(String(id))}')"><i class="fa fa-check"></i></button>
-              <button class="action-btn" onclick="rejectWithdrawalInDetail('${escapeHtml(String(id))}')"><i class="fa fa-times"></i></button>
-            </div>
-          </li>`;
-        }).join('');
-      } catch (err) {
-        console.error(err);
-        el.innerHTML = '<li class="muted">Failed to load withdrawals</li>';
       }
     }
 
