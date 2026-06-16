@@ -1369,35 +1369,50 @@
       if (!confirm("Delete this combo?")) return;
 
       const attempts = [
-        // Path param (most common)
+        // direct DELETE with path
         { method: 'DELETE', url: `/admin/combos/${encodeURIComponent(comboId)}` },
-        // Query param
+        // DELETE with query param
         { method: 'DELETE', url: `/admin/combos?id=${encodeURIComponent(comboId)}` },
-        // DELETE with JSON body { id } (some servers accept)
+        // DELETE with JSON body
         { method: 'DELETE', url: `/admin/combos`, body: { id: comboId } },
-        // POST /admin/combos/delete { id } and {_id}
+        // POST endpoints (JSON)
         { method: 'POST', url: `/admin/combos/delete`, body: { id: comboId } },
         { method: 'POST', url: `/admin/combos/delete`, body: { _id: comboId } },
-        // Some backends have /combos/remove
-        { method: 'POST', url: `/admin/combos/remove`, body: { id: comboId } },
-        // Remove-combo variants
-        { method: 'DELETE', url: `/admin/remove-combo/${encodeURIComponent(comboId)}` },
+        { method: 'POST', url: `/admin/combo/delete`, body: { id: comboId } },
+        { method: 'POST', url: `/admin/combo/remove`, body: { id: comboId } },
         { method: 'POST', url: `/admin/remove-combo`, body: { id: comboId } },
-        // assign-combo delete variants
-        { method: 'POST', url: `/admin/assign-combo/delete`, body: { id: comboId } },
-        // combo-specific delete path
-        { method: 'POST', url: `/admin/combos/${encodeURIComponent(comboId)}/delete`, body: null }
+        { method: 'POST', url: `/admin/combos/remove`, body: { id: comboId } },
+        // form encoded POST (some servers expect form data)
+        { method: 'POST-FORM', url: `/admin/combos/delete`, body: { id: comboId } },
+        // method override
+        { method: 'POST', url: `/admin/combos?_method=DELETE`, body: { id: comboId } },
+        { method: 'POST', url: `/admin/combos/${encodeURIComponent(comboId)}/delete`, body: null },
+        // final fallback: GET delete (rare)
+        { method: 'GET', url: `/admin/combos/delete?id=${encodeURIComponent(comboId)}` }
       ];
 
       let lastError = null;
       for (const a of attempts) {
         try {
-          const opts = { method: a.method, headers: { 'x-admin-token': localStorage.getItem('adminToken') } };
+          let opts = { method: a.method === 'POST-FORM' ? 'POST' : a.method, headers: { 'x-admin-token': localStorage.getItem('adminToken') } };
           if (a.body) {
-            opts.headers['Content-Type'] = 'application/json';
-            opts.body = JSON.stringify(a.body);
+            if (a.method === 'POST-FORM') {
+              opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+              opts.body = Object.keys(a.body).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(a.body[k])).join('&');
+            } else if (a.method === 'GET' || (a.method === 'DELETE' && a.url.includes('?'))) {
+              // no body for GET/DELETE with query
+            } else {
+              opts.headers['Content-Type'] = 'application/json';
+              opts.body = JSON.stringify(a.body);
+            }
           }
+
+          console.debug('Attempting delete:', opts.method, a.url, opts.body ? opts.body : '');
           const res = await fetch(a.url, opts);
+
+          // log response text for debugging
+          const text = await res.text().catch(()=>null);
+          console.debug('Delete attempt response:', a.url, res.status, text);
 
           // auth failure -> stop and logout
           if (res.status === 401 || res.status === 403) {
@@ -1406,23 +1421,24 @@
             return;
           }
 
-          // If resource not found, try next attempt
           if (res.status === 404) {
-            console.warn('Delete attempt returned 404 for', a.url);
-            lastError = { url: a.url, status: 404 };
+            // resource not found at this endpoint — try next
+            lastError = { url: a.url, status: 404, body: text };
             continue;
           }
 
-          // For other non-ok statuses, capture message and try next (unless it's a fatal client error)
           if (!res.ok) {
-            const bodyText = await res.text().catch(()=>null);
-            console.warn('Delete attempt failed', a.url, res.status, bodyText);
-            lastError = { url: a.url, status: res.status, body: bodyText };
+            // non-ok (400/500 etc) — log and continue trying other patterns
+            lastError = { url: a.url, status: res.status, body: text };
             continue;
           }
 
           // success (200/204)
-          showToast('Combo deleted.');
+          // try parse JSON to get server message if present
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch(e){ parsed = null; }
+          const msg = (parsed && parsed.message) ? parsed.message : 'Combo deleted.';
+          showToast(msg);
           await loadCombosForDetail(window._currentDetailUser);
           return;
         } catch (err) {
@@ -1433,7 +1449,12 @@
       }
 
       console.error('All delete attempts failed', lastError);
-      showToast('Failed to delete combo (see console).');
+      // Show a concise toast with server message if available
+      if (lastError && lastError.body) {
+        showToast('Delete failed: ' + (lastError.body.slice ? lastError.body.slice(0, 140) : JSON.stringify(lastError.body)));
+      } else {
+        showToast('Failed to delete combo (see console).');
+      }
     }
 
     async function deleteComboInDetail_old(comboId) {
