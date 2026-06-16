@@ -518,41 +518,202 @@
     // Use username as stable identifier so editing a user always loads the correct DB fields
     let selectedUsers = new Set(); // stores usernames
     let editingOriginalUsername = null; // stores the original username while editing
-    let allUsers = [];
+    let allUsers = []; // currently-loaded users (page)
+    // Pagination & caching config
+    const USERS_PAGE_LIMIT = 200; // how many users to fetch per page in foreground (reasonable cap)
+    const USERS_CACHE_TTL = 1000 * 60 * 5; // 5 minutes cache TTL
+
+    // internal cache structure stored in localStorage under key 'admin_users_cache_v1'
+    // { pages: { "1": { users: [...], ts }, "2": { ... } }, total, perPage }
+    function getUsersCache() {
+      try {
+        const raw = localStorage.getItem('admin_users_cache_v1');
+        if (!raw) return { pages: {}, total: 0, perPage: USERS_PAGE_LIMIT };
+        const obj = JSON.parse(raw);
+        if (!obj || typeof obj !== 'object') return { pages: {}, total: 0, perPage: USERS_PAGE_LIMIT };
+        return obj;
+      } catch (e) {
+        return { pages: {}, total: 0, perPage: USERS_PAGE_LIMIT };
+      }
+    }
+    function setUsersCache(cache) {
+      try {
+        localStorage.setItem('admin_users_cache_v1', JSON.stringify(cache));
+      } catch (e) {
+        // ignore quota failures
+      }
+    }
+    function isPageFresh(pageEntry) {
+      if (!pageEntry || !pageEntry.ts) return false;
+      return (Date.now() - pageEntry.ts) < USERS_CACHE_TTL;
+    }
 
     // small helper to escape single quotes when embedding usernames into inline onclick handlers
     function escapeForInline(s = "") {
       return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     }
 
-    async function fetchUsers() {
+    // --- Core: fetch paged users (tries cache first unless forceRefresh true) ---
+    async function fetchUsers(page = 1, limit = USERS_PAGE_LIMIT, forceRefresh = false) {
       try {
-        const res = await fetch('/admin/users', {
+        // check cache
+        const cache = getUsersCache();
+        const pageKey = String(page);
+        if (!forceRefresh && cache.pages && cache.pages[pageKey] && isPageFresh(cache.pages[pageKey])) {
+          // use cached page
+          allUsers = cache.pages[pageKey].users || [];
+          renderUsers(allUsers);
+          // still kick off a background refresh to keep cache fresh
+          backgroundRefreshUsersPage(page, limit);
+          // prefetch next page in background if total indicates more pages
+          if (cache.total && cache.total > (page * limit)) {
+            prefetchUsersPage(page + 1, limit);
+          }
+          return;
+        }
+
+        // request from server (paginated); server returns { users, page, limit, total } or legacy array
+        let url = `/admin/users?page=${page}&limit=${limit}`;
+        const res = await fetch(url, {
           headers: { 'x-admin-token': localStorage.getItem('adminToken') }
         });
-        if (!res.ok) throw new Error('Unauthorized');
-        allUsers = await res.json();
+        if (!res.ok) {
+          // If unauthorized, fallback to fetching without pagination (legacy route) to keep UI functional
+          if (res.status === 401 || res.status === 403) throw new Error('Unauthorized');
+        }
+
+        const data = await res.json().catch(() => null);
+
+        // Normalize response shapes:
+        // - New server: { users: [...], page, limit, total }
+        // - Older server: returns an array (all users)
+        let users = [];
+        let total = 0;
+        if (data) {
+          if (Array.isArray(data)) {
+            users = data;
+            total = data.length;
+          } else if (Array.isArray(data.users)) {
+            users = data.users;
+            total = typeof data.total === 'number' ? data.total : (users.length);
+          } else if (Array.isArray(data.items)) {
+            // accept items too
+            users = data.items;
+            total = typeof data.total === 'number' ? data.total : users.length;
+          } else {
+            // Unknown shape; try to find array inside response
+            for (const k of Object.keys(data)) {
+              if (Array.isArray(data[k])) { users = data[k]; break; }
+            }
+            total = typeof data.total === 'number' ? data.total : users.length;
+          }
+        }
+
+        // Update cache
+        const newCache = getUsersCache();
+        newCache.pages = newCache.pages || {};
+        newCache.pages[pageKey] = { users, ts: Date.now() };
+        newCache.total = typeof total === 'number' ? total : (newCache.total || users.length);
+        newCache.perPage = limit;
+        setUsersCache(newCache);
+
+        allUsers = users;
         renderUsers(allUsers);
 
-        // If this page was opened with #user=..., auto-open that user in drawer
-        try {
-          const hash = window.location.hash || '';
-          if (hash && hash.includes('user=')) {
-            const params = new URLSearchParams(hash.replace(/^#/, ''));
-            const u = params.get('user');
-            if (u) {
-              // small timeout to ensure UI rendered
-              setTimeout(() => {
-                openUserPage(decodeURIComponent(u));
-              }, 240);
-            }
-          }
-        } catch (e) {}
+        // Background refresh to keep data live
+        backgroundRefreshUsersPage(page, limit);
+
+        // Prefetch next page if there are more items
+        if (newCache.total && newCache.total > (page * limit)) {
+          prefetchUsersPage(page + 1, limit);
+        }
       } catch (err) {
+        console.error('fetchUsers error', err);
         alert("Session expired or unauthorized. Please login again.");
         logout();
       }
     }
+
+    // Background refresh: fetch page but don't block UI; update cache & UI if changed
+    async function backgroundRefreshUsersPage(page = 1, limit = USERS_PAGE_LIMIT) {
+      try {
+        const url = `/admin/users?page=${page}&limit=${limit}`;
+        const res = await fetch(url, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        if (!res.ok) return;
+        const data = await res.json().catch(() => null);
+        if (!data) return;
+        let users = [];
+        let total = 0;
+        if (Array.isArray(data)) {
+          users = data; total = data.length;
+        } else if (Array.isArray(data.users)) {
+          users = data.users; total = typeof data.total === 'number' ? data.total : users.length;
+        } else if (Array.isArray(data.items)) {
+          users = data.items; total = typeof data.total === 'number' ? data.total : users.length;
+        } else {
+          for (const k of Object.keys(data)) {
+            if (Array.isArray(data[k])) { users = data[k]; break; }
+          }
+          total = typeof data.total === 'number' ? data.total : users.length;
+        }
+
+        const cache = getUsersCache();
+        cache.pages = cache.pages || {};
+        const pageKey = String(page);
+        cache.pages[pageKey] = { users, ts: Date.now() };
+        cache.total = typeof total === 'number' ? total : (cache.total || users.length);
+        cache.perPage = limit;
+        setUsersCache(cache);
+
+        // if current UI is displaying this page, update UI if changed
+        // simple deep-check via JSON length+first/last id heuristic to minimize renders
+        const currentIds = (allUsers || []).map(u => u.username || u.id || (u._id || '')).join(',');
+        const newIds = users.map(u => u.username || u.id || (u._id || '')).join(',');
+        if (currentIds !== newIds) {
+          allUsers = users;
+          renderUsers(allUsers);
+        }
+      } catch (e) {
+        // silent
+      }
+    }
+
+    // Prefetch page (store in cache)
+    async function prefetchUsersPage(page = 2, limit = USERS_PAGE_LIMIT) {
+      try {
+        const cache = getUsersCache();
+        if (cache.pages && cache.pages[String(page)] && isPageFresh(cache.pages[String(page)])) return;
+        const url = `/admin/users?page=${page}&limit=${limit}`;
+        const res = await fetch(url, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        if (!res.ok) return;
+        const data = await res.json().catch(() => null);
+        if (!data) return;
+        let users = [];
+        let total = 0;
+        if (Array.isArray(data)) {
+          users = data; total = data.length;
+        } else if (Array.isArray(data.users)) {
+          users = data.users; total = typeof data.total === 'number' ? data.total : users.length;
+        } else if (Array.isArray(data.items)) {
+          users = data.items; total = typeof data.total === 'number' ? data.total : users.length;
+        } else {
+          for (const k of Object.keys(data)) {
+            if (Array.isArray(data[k])) { users = data[k]; break; }
+          }
+          total = typeof data.total === 'number' ? data.total : users.length;
+        }
+        cache.pages = cache.pages || {};
+        cache.pages[String(page)] = { users, ts: Date.now() };
+        cache.total = typeof total === 'number' ? total : (cache.total || users.length);
+        cache.perPage = limit;
+        setUsersCache(cache);
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    // On initial load we request page 1 (but accept legacy array responses)
+    // Initial call placed at the bottom near 'Initial load' to keep original flow similar.
 
     function renderUsers(users) {
       const table = document.getElementById("usersTable");
@@ -617,7 +778,8 @@
         const data = await res.json();
         if (res.ok && data.success) {
           showToast('User task set reset!');
-          fetchUsers();
+          // refresh current page
+          fetchUsers(1, USERS_PAGE_LIMIT, true);
         } else {
           showToast('Failed to reset task set: ' + (data.message || 'Unknown error'));
         }
@@ -645,13 +807,45 @@
       renderUsers(filtered);
     }
 
-    function searchUsers() {
-      const query = document.getElementById("searchInput").value.toLowerCase();
-      const filtered = allUsers.filter(user =>
-        user.username.toLowerCase().includes(query) ||
-        (user.phone && user.phone.includes(query))
-      );
-      renderUsers(filtered);
+    // Search: if query length >=3 use server-side search (fast & avoids loading entire DB),
+    // otherwise filter current cached page client-side.
+    async function searchUsers() {
+      const query = document.getElementById("searchInput").value.trim();
+      if (!query) {
+        // reset to current page (page 1)
+        fetchUsers(1, USERS_PAGE_LIMIT, false);
+        return;
+      }
+      const qLower = query.toLowerCase();
+      if (query.length >= 3) {
+        // server-side search (paginated)
+        try {
+          const url = `/admin/users?q=${encodeURIComponent(query)}&page=1&limit=${USERS_PAGE_LIMIT}`;
+          const res = await fetch(url, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+          if (!res.ok) { showToast('Search failed'); return; }
+          const data = await res.json().catch(()=>null);
+          let users = [];
+          if (Array.isArray(data)) users = data;
+          else if (Array.isArray(data.users)) users = data.users;
+          else if (Array.isArray(data.items)) users = data.items;
+          else {
+            for (const k of Object.keys(data||{})) { if (Array.isArray(data[k])) { users = data[k]; break; } }
+          }
+          allUsers = users;
+          renderUsers(allUsers);
+          // cache this search result separately? For simplicity we won't persist search results to localStorage
+        } catch (err) {
+          console.error('searchUsers error', err);
+          showToast('Search failed');
+        }
+      } else {
+        // client-side filter on cached users (fast)
+        const filtered = allUsers.filter(user =>
+          user.username.toLowerCase().includes(qLower) ||
+          (user.phone && String(user.phone).toLowerCase().includes(qLower))
+        );
+        renderUsers(filtered);
+      }
     }
 
     function showAddUserModal() {
@@ -751,6 +945,11 @@
           }
           showToast("User updated!");
 
+          // invalidate cache and refresh current page
+          const cache = getUsersCache();
+          cache.pages = {}; setUsersCache(cache);
+          fetchUsers(1, USERS_PAGE_LIMIT, true);
+
           // Best-effort: notify the user about the credit score change
           try {
             await fetch('/admin/notifications', {
@@ -788,6 +987,11 @@
           }
           showToast("User added!");
 
+          // invalidate cache and refresh
+          const cache = getUsersCache();
+          cache.pages = {}; setUsersCache(cache);
+          fetchUsers(1, USERS_PAGE_LIMIT, true);
+
           // Best-effort: notify the user about the credit score (new account)
           try {
             await fetch('/admin/notifications', {
@@ -807,14 +1011,16 @@
       }
       editingOriginalUsername = null;
       closeUserModal();
-      fetchUsers();
+      // Refresh current page to include new user
+      fetchUsers(1, USERS_PAGE_LIMIT, true);
     };
 
     function editUser(username) {
       const user = allUsers.find(u => u.username === username);
       if (!user) {
         showToast("User not found or data stale. Refreshing list...");
-        fetchUsers();
+        // force refresh the current page
+        fetchUsers(1, USERS_PAGE_LIMIT, true);
         return;
       }
       editingOriginalUsername = user.username;
@@ -868,7 +1074,8 @@
           return;
         }
         showToast(data.status === 'Active' ? "User unsuspended." : "User suspended.");
-        fetchUsers();
+        // refresh current page
+        fetchUsers(1, USERS_PAGE_LIMIT, true);
       } catch (err) {
         showToast("Network/server error when suspending/unsuspending user.");
       }
@@ -888,7 +1095,10 @@
         }
         selectedUsers.delete(username);
         showToast("User deleted.");
-        fetchUsers();
+        // invalidate cache and refresh current page
+        const cache = getUsersCache();
+        cache.pages = {}; setUsersCache(cache);
+        fetchUsers(1, USERS_PAGE_LIMIT, true);
       } catch (err) {
         showToast("Network/server error when deleting user.");
       }
@@ -909,8 +1119,9 @@
         }
       }
       showToast(failed > 0 ? `Some users failed to suspend/unsuspend.` : "Selected users suspended/unsuspended.");
-      fetchUsers();
+      // refresh page and clear selection
       selectedUsers.clear();
+      fetchUsers(1, USERS_PAGE_LIMIT, true);
     }
     async function bulkDeleteUsers() {
       if (!confirm("Are you sure you want to delete selected users?")) return;
@@ -929,50 +1140,102 @@
       }
       selectedUsers.clear();
       showToast(failed > 0 ? "Some users failed to delete." : "Selected users deleted.");
-      fetchUsers();
+      // refresh
+      fetchUsers(1, USERS_PAGE_LIMIT, true);
     }
 
     function exportUsersCSV() {
-      const header = [
-        "ID","Username","Phone","VIP Level","Balance","Status","Current Set",
-        "Exchange","Wallet Address","Login Password","Withdraw Password","Gender",
-        "Commission","Commission Today","Last Commission Reset","Invite Code","Referred By",
-        "Created At","Task Count Today","Tasks Completed In Set","Set Starting Balance","Token","Credit Score"
-      ];
-      const rows = allUsers.map(u => ([
-        u.id || "",
-        u.username || "",
-        u.phone || "",
-        u.vipLevel != null ? u.vipLevel : "",
-        u.balance != null ? u.balance : "",
-        u.status || "",
-        u.currentSet != null ? u.currentSet : "",
-        u.exchange || "",
-        u.walletAddress || "",
-        u.loginPassword || "",
-        u.withdrawPassword || "",
-        u.gender || "",
-        u.commission != null ? u.commission : "",
-        u.commissionToday != null ? u.commissionToday : "",
-        u.lastCommissionReset || "",
-        u.inviteCode || "",
-        u.referredBy || "",
-        u.createdAt || "",
-        u.taskCountToday != null ? u.taskCountToday : "",
-        u.tasksCompletedInSet != null ? u.tasksCompletedInSet : "",
-        u.setStartingBalance != null ? u.setStartingBalance : "",
-        u.token || "",
-        u.creditScore != null ? u.creditScore : 100
-      ]));
-      const csv = [header, ...rows].map(row => row.map(String).map(s=>`"${s.replace(/"/g,'""')}"`).join(",")).join("\n");
-      const blob = new Blob([csv], { type: "text/csv" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "users.csv";
-      a.click();
-      URL.revokeObjectURL(url);
-      showToast("Exported to CSV!");
+      // If the cache contains all pages already loaded (i.e., total <= current page size), use it.
+      // Otherwise, fetch all pages sequentially and produce CSV.
+      (async () => {
+        try {
+          const cache = getUsersCache();
+          const total = cache.total || 0;
+          const perPage = cache.perPage || USERS_PAGE_LIMIT;
+          if (total <= perPage && cache.pages && cache.pages['1'] && cache.pages['1'].users) {
+            const usersToExport = cache.pages['1'].users;
+            doExportCSV(usersToExport);
+            return;
+          }
+
+          // otherwise fetch all pages sequentially
+          showToast('Exporting: fetching all users from server (this may take a moment)...');
+          const pages = [];
+          let page = 1;
+          let fetched = 0;
+          const all = [];
+          while (true) {
+            const url = `/admin/users?page=${page}&limit=${perPage}`;
+            const res = await fetch(url, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+            if (!res.ok) throw new Error('Failed to fetch users for export');
+            const data = await res.json().catch(()=>null);
+            let users = [];
+            let totalResp = 0;
+            if (Array.isArray(data)) { users = data; totalResp = data.length; }
+            else if (Array.isArray(data.users)) { users = data.users; totalResp = typeof data.total === 'number' ? data.total : users.length; }
+            else if (Array.isArray(data.items)) { users = data.items; totalResp = typeof data.total === 'number' ? data.total : users.length; }
+            else {
+              for (const k of Object.keys(data||{})) { if (Array.isArray(data[k])) { users = data[k]; break; } }
+              totalResp = typeof data.total === 'number' ? data.total : users.length;
+            }
+            if (!users.length) break;
+            all.push(...users);
+            fetched += users.length;
+            if (totalResp && fetched >= totalResp) break;
+            if (!totalResp && users.length < perPage) break; // no more pages
+            page++;
+            // small throttle to avoid hammering server
+            await new Promise(r => setTimeout(r, 150));
+          }
+          doExportCSV(all);
+        } catch (err) {
+          console.error('exportUsersCSV error', err);
+          showToast('Export failed');
+        }
+      })();
+
+      function doExportCSV(users) {
+        const header = [
+          "ID","Username","Phone","VIP Level","Balance","Status","Current Set",
+          "Exchange","Wallet Address","Login Password","Withdraw Password","Gender",
+          "Commission","Commission Today","Last Commission Reset","Invite Code","Referred By",
+          "Created At","Task Count Today","Tasks Completed In Set","Set Starting Balance","Token","Credit Score"
+        ];
+        const rows = users.map(u => ([
+          u.id || "",
+          u.username || "",
+          u.phone || "",
+          u.vipLevel != null ? u.vipLevel : "",
+          u.balance != null ? u.balance : "",
+          u.status || "",
+          u.currentSet != null ? u.currentSet : "",
+          u.exchange || "",
+          u.walletAddress || "",
+          u.loginPassword || "",
+          u.withdrawPassword || "",
+          u.gender || "",
+          u.commission != null ? u.commission : "",
+          u.commissionToday != null ? u.commissionToday : "",
+          u.lastCommissionReset || "",
+          u.inviteCode || "",
+          u.referredBy || "",
+          u.createdAt || "",
+          u.taskCountToday != null ? u.taskCountToday : "",
+          u.tasksCompletedInSet != null ? u.tasksCompletedInSet : "",
+          u.setStartingBalance != null ? u.setStartingBalance : "",
+          u.token || "",
+          u.creditScore != null ? u.creditScore : 100
+        ])));
+        const csv = [header, ...rows].map(row => row.map(String).map(s=>`"${s.replace(/"/g,'""')}"`).join(",")).join("\n");
+        const blob = new Blob([csv], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "users.csv";
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast("Exported to CSV!");
+      }
     }
 
     // -- User detail panel logic and collapsible sections --
@@ -1076,11 +1339,12 @@
 
     async function fetchUserCombosCount(username) {
       try {
-        const res = await fetch('/admin/combos', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        // use server-side filtered query (if implemented) by fetching only page=1 with large limit and counting matches
+        const res = await fetch(`/admin/combos?page=1&limit=50`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) return 0;
         const combos = await res.json();
-        if (!Array.isArray(combos)) return 0;
-        return combos.filter(c => (c.username === username)).length;
+        const arr = Array.isArray(combos) ? combos : (combos && Array.isArray(combos.combos) ? combos.combos : []);
+        return arr.filter(c => (c.username === username)).length;
       } catch { return 0; }
     }
 
@@ -1303,8 +1567,11 @@
         const all = await res.json();
         // /admin/transactions returns merged deposits/withdrawals or object; handle both
         let deposits = [];
-        if (Array.isArray(all)) deposits = all;
-        else deposits = Array.isArray(all.deposits) ? all.deposits : [];
+        if (Array.isArray(all)) {
+          deposits = all;
+        } else {
+          deposits = Array.isArray(all.deposits) ? all.deposits : [];
+        }
         // include transactions with type 'admin_add_balance' or similar
         const filtered = deposits.filter(d => {
           const t = (d.type || '').toString().toLowerCase();
@@ -1456,7 +1723,8 @@
           showToast('Balance added');
           container.innerHTML = '';
           await loadDepositsForDetail(username);
-          fetchUsers();
+          // refresh users page for updated balance
+          fetchUsers(1, USERS_PAGE_LIMIT, true);
         } catch (err) {
           console.error(err);
           showToast('Failed to add balance');
@@ -1494,7 +1762,8 @@
         showToast('VIP updated');
         closeVipModal();
         if (window._currentDetailUser === username) await loadUserDetail(username);
-        fetchUsers();
+        // refresh current page
+        fetchUsers(1, USERS_PAGE_LIMIT, true);
       } catch (err) {
         console.error(err);
         showToast('Failed to update VIP');
@@ -1527,7 +1796,12 @@
 
     // Utility: fetch counts used earlier are implemented above.
     // --- Initial load ---
-    fetchUsers();
+    // On load, fetch page 1 (use cache if available) and set a background refresh interval
+    fetchUsers(1, USERS_PAGE_LIMIT, false);
+    setInterval(() => {
+      // periodic background refresh of page 1 only (keeps admin panel reasonably fresh)
+      backgroundRefreshUsersPage(1, USERS_PAGE_LIMIT);
+    }, 1000 * 30); // every 30s
 
     // --- small helpers ---
     function showToast(msg) {
