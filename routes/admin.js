@@ -591,7 +591,7 @@ router.post('/settings', asyncHandler(async (req, res) => {
 }));
 
 // ===================== USERS API (RESTful) ===================== //
-// NOTE: This endpoint now supports server-side pagination, search (q), and newest-first sorting.
+// NOTE: This endpoint supports server-side pagination, search (q), and newest-first sorting.
 // Query params:
 //  - q (optional): search term (matches username and phone, case-insensitive substring)
 //  - page (optional, default 1)
@@ -671,6 +671,35 @@ router.get('/users', asyncHandler(async (req, res) => {
         limit,
         total: typeof total === 'number' ? total : 0
     });
+}));
+
+// Lightweight summary endpoint for autocomplete / appbar search
+// GET /admin/users/summary?q=<term>&limit=30
+router.get('/users/summary', asyncHandler(async (req, res) => {
+  const q = (req.query.q || '').toString().trim();
+  let limit = parseInt(req.query.limit, 10);
+  if (isNaN(limit) || limit < 1) limit = 30;
+  const MAX = 200;
+  if (limit > MAX) limit = MAX;
+
+  const query = {};
+  if (q) {
+    const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(esc, 'i');
+    query.$or = [
+      { username: { $regex: regex } },
+      { phone: { $regex: regex } }
+    ];
+  }
+
+  // Return minimal projection to keep payload tiny
+  const users = await User.find(query, { username: 1, balance: 1 })
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(limit)
+    .lean()
+    .exec();
+
+  res.json({ users });
 }));
 
 router.post('/users', asyncHandler(async (req, res) => {
