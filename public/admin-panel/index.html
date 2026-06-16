@@ -698,8 +698,8 @@
       syncIframeDarkMode();
       showDashboardOverview();
       renderCharts();
-      // preload users for appbar search autocomplete
-      fetchAllUsersForAppbar();
+      // NOTE: do NOT preload the full users list here to avoid blocking the UI.
+      // fetchAllUsersForAppbar(); <-- removed to prevent loading entire collection on load.
     });
     document.body.addEventListener('classChange', syncIframeDarkMode);
     document.getElementById('mainFrame').addEventListener('load', syncIframeDarkMode);
@@ -1002,47 +1002,78 @@
     /* ===== end Add User modal wiring ===== */
 
     //
-    // Appbar user search: fetch users once and show autocomplete; selecting opens users.html#user=<username>
+    // Appbar user search: use server-side search on demand instead of preloading all users.
     //
     let _appbarUsersCache = [];
+    let _appbarSearchTimer = null;
 
+    // NO-OP fetchAllUsersForAppbar to ensure any old callers won't fetch full list.
     async function fetchAllUsersForAppbar() {
+      // Intentionally empty to avoid loading the entire users collection at startup.
+      _appbarUsersCache = [];
+    }
+
+    // Query server for matching users (debounced caller should call this)
+    async function fetchUsersForAppbarQuery(q) {
+      if (!q || !q.trim()) {
+        _appbarUsersCache = [];
+        renderAppbarAutocomplete([]);
+        return;
+      }
       try {
-        const res = await fetch('/admin/users', {
+        // Use server-side search with a small limit to keep responses light.
+        const url = `/admin/users?q=${encodeURIComponent(q)}&page=1&limit=30`;
+        const res = await fetch(url, {
           headers: { 'x-admin-token': localStorage.getItem('adminToken') }
         });
-        if (res.ok) {
-          _appbarUsersCache = await res.json();
-        } else {
+        if (!res.ok) {
           _appbarUsersCache = [];
+          renderAppbarAutocomplete([]);
+          return;
         }
+        const data = await res.json().catch(() => null);
+        let users = [];
+        if (Array.isArray(data)) users = data;
+        else if (data && Array.isArray(data.users)) users = data.users;
+        else if (data && Array.isArray(data.items)) users = data.items;
+        else if (data && typeof data === 'object') {
+          // fallback: find first array property
+          for (const k of Object.keys(data)) {
+            if (Array.isArray(data[k])) { users = data[k]; break; }
+          }
+        }
+        _appbarUsersCache = users || [];
+        renderAppbarAutocomplete(_appbarUsersCache);
       } catch (e) {
+        console.error('fetchUsersForAppbarQuery error', e);
         _appbarUsersCache = [];
+        renderAppbarAutocomplete([]);
       }
     }
 
+    // Debounced input handler
     function onAppbarUserInput() {
-      const q = document.getElementById('appbarUserSearch').value.trim().toLowerCase();
+      const q = document.getElementById('appbarUserSearch').value.trim();
       const list = document.getElementById('appbarAutocomplete');
       if (!q) {
         list.style.display = 'none';
         return;
       }
-      const matches = _appbarUsersCache.filter(u => {
-        if (!u || !u.username) return false;
-        return u.username.toLowerCase().includes(q) || (u.phone && String(u.phone).includes(q));
-      }).slice(0, 30);
-      renderAppbarAutocomplete(matches);
+      // debounce server queries
+      if (_appbarSearchTimer) clearTimeout(_appbarSearchTimer);
+      _appbarSearchTimer = setTimeout(() => {
+        fetchUsersForAppbarQuery(q);
+      }, 220);
     }
 
     function renderAppbarAutocomplete(matches) {
       const list = document.getElementById('appbarAutocomplete');
       list.innerHTML = '';
-      if (!matches.length) {
+      if (!matches || !matches.length) {
         list.style.display = 'none';
         return;
       }
-      matches.forEach(u => {
+      matches.slice(0, 30).forEach(u => {
         const div = document.createElement('div');
         div.className = 'item';
         const left = document.createElement('div');
@@ -1063,15 +1094,45 @@
         e.preventDefault();
         const q = document.getElementById('appbarUserSearch').value.trim();
         if (!q) return;
-        // If exact match exists, open that user; otherwise open users page with hash to search there.
+        // If exact match exists in current cache, open that user; otherwise run a server query and act on result
         const exact = _appbarUsersCache.find(u => u.username === q);
         if (exact) {
           selectUserFromAppbar(exact.username);
           return;
         }
-        // fallback: open users page with hash so users.html can read hash and open drawer
-        showIframePage('users.html#user=' + encodeURIComponent(q));
-        document.getElementById('appbarAutocomplete').style.display = 'none';
+        // fall back to server search for exact match
+        (async () => {
+          try {
+            const url = `/admin/users?q=${encodeURIComponent(q)}&page=1&limit=10`;
+            const res = await fetch(url, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+            if (!res.ok) {
+              // fallback: open users page with hash
+              showIframePage('users.html#user=' + encodeURIComponent(q));
+              document.getElementById('appbarAutocomplete').style.display = 'none';
+              return;
+            }
+            const data = await res.json().catch(()=>null);
+            let users = [];
+            if (Array.isArray(data)) users = data;
+            else if (data && Array.isArray(data.users)) users = data.users;
+            else if (data && Array.isArray(data.items)) users = data.items;
+            else {
+              for (const k of Object.keys(data||{})) if (Array.isArray(data[k])) { users = data[k]; break; }
+            }
+            if (users && users.length) {
+              const match = users.find(u => u.username === q) || users[0];
+              selectUserFromAppbar(match.username);
+            } else {
+              // no matches: open users page with hash to let the users UI handle it
+              showIframePage('users.html#user=' + encodeURIComponent(q));
+            }
+          } catch (err) {
+            console.error('onAppbarUserKeyDown search error', err);
+            showIframePage('users.html#user=' + encodeURIComponent(q));
+          } finally {
+            document.getElementById('appbarAutocomplete').style.display = 'none';
+          }
+        })();
       } else if (e.key === 'Escape') {
         document.getElementById('appbarAutocomplete').style.display = 'none';
       }
