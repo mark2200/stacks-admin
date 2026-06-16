@@ -1,5 +1,3 @@
-
-````javascript name=admin.js
 const express = require('express');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
@@ -48,9 +46,6 @@ function asyncHandler(fn) {
 let cachedCloudinaryProducts = [];
 let lastCloudinaryFetch = 0;
 const CLOUDINARY_CACHE_DURATION = 1000 * 60 * 10; // 10 minutes
-
-// Background fetch guard so we don't run many full fetches in parallel
-let isCloudinaryBackgroundFetchRunning = false;
 
 // Helper: extract price using multiple heuristics (context, tags, public_id)
 function extractPriceFromResource(r) {
@@ -118,19 +113,16 @@ function generateRandomPrice(min = 10, max = 100) {
   return Math.round((v + Number.EPSILON) * 100) / 100;
 }
 
-// Fetch and cache Cloudinary products in a robust way (handles paging).
-// NOTE: maxItems param allows limiting the number of items fetched in a foreground request.
-// Passing Infinity will fetch all pages.
-async function fetchCloudinaryProductsAdmin(maxItems = Infinity) {
+// Fetch and cache Cloudinary products in a robust way (handles paging)
+async function fetchCloudinaryProductsAdmin() {
   const prefixEnv = (process.env.CLOUDINARY_PRODUCTS_PREFIX || '').toString();
   let products = [];
   let next_cursor = undefined;
-  let fetched = 0;
 
   do {
     const opts = {
       type: 'upload',
-      max_results: Math.min(500, Math.max(1, Math.floor(Math.min(maxItems - fetched, 500)))),
+      max_results: 500,
       context: true,
       tags: true,
       ...(next_cursor ? { next_cursor } : {})
@@ -158,9 +150,7 @@ async function fetchCloudinaryProductsAdmin(maxItems = Infinity) {
     }).filter(p => p.image); // only keep items with url
 
     products = products.concat(pageProducts);
-    fetched += (result.resources || []).length;
     next_cursor = result.next_cursor;
-    if (fetched >= maxItems) break;
   } while (next_cursor);
 
   // Assign reasonable random prices to items lacking a numeric price
@@ -182,40 +172,12 @@ async function fetchCloudinaryProductsAdmin(maxItems = Infinity) {
     return { ...p, _priceAssigned: 'extracted' };
   });
 
-  // If we fetched only a partial set (maxItems limited), merge results with existing cache
-  if (maxItems !== Infinity) {
-    // simply replace cache only if we fetched something meaningful
-    if (products.length) {
-      cachedCloudinaryProducts = products;
-      lastCloudinaryFetch = Date.now();
-    }
-  } else {
-    // full fetch replaces cache
-    cachedCloudinaryProducts = products;
-    lastCloudinaryFetch = Date.now();
-  }
+  cachedCloudinaryProducts = products;
+  lastCloudinaryFetch = Date.now();
 
-  console.log(`Admin Cloudinary fetch: loaded ${products.length} product(s) (prefix='${prefixEnv}'). numeric:${numericPrices.length}; randomAssigned:${randomAssignedCount}`);
+  console.log(`Admin Cloudinary fetch: loaded ${cachedCloudinaryProducts.length} product(s) (prefix='${prefixEnv}'). numeric:${numericPrices.length}; randomAssigned:${randomAssignedCount}`);
 
-  return products;
-}
-
-// Start a background full fetch if needed (single-run guard)
-function startBackgroundFullCloudinaryFetchIfNeeded() {
-  if (isCloudinaryBackgroundFetchRunning) return;
-  isCloudinaryBackgroundFetchRunning = true;
-  // run asynchronously so request path doesn't wait
-  setImmediate(async () => {
-    try {
-      console.log('Starting background Cloudinary full sync...');
-      await fetchCloudinaryProductsAdmin(Infinity);
-      console.log('Background Cloudinary full sync completed.');
-    } catch (err) {
-      console.error('Background Cloudinary fetch failed:', err && err.message ? err.message : err);
-    } finally {
-      isCloudinaryBackgroundFetchRunning = false;
-    }
-  });
+  return cachedCloudinaryProducts;
 }
 
 // ==================== Admin endpoints to fetch & refresh products ====================
@@ -225,8 +187,6 @@ router.get('/admin/refresh-products', asyncHandler(async (req, res) => {
     res.json({ success: true, message: "Product cache cleared, will refresh on next fetch." });
 }));
 
-// The cloudinary-products endpoint will return a cached view. If the cache is empty it fetches a bounded
-// number of items synchronously (fast) and triggers a background full fetch to populate the rest.
 router.get('/cloudinary-products', asyncHandler(async (req, res) => {
     let { minPrice, maxPrice, search } = req.query;
     minPrice = minPrice ? parseFloat(minPrice) : 0;
@@ -234,12 +194,8 @@ router.get('/cloudinary-products', asyncHandler(async (req, res) => {
 
     const now = Date.now();
     try {
-      // If cache is empty or stale, fetch a bounded number synchronously to keep the endpoint responsive
       if (!cachedCloudinaryProducts.length || (now - lastCloudinaryFetch > CLOUDINARY_CACHE_DURATION)) {
-          // fetch only 200 items for the foreground request (quick)
-          await fetchCloudinaryProductsAdmin(200);
-          // then start a background full fetch to populate cache fully (non-blocking)
-          startBackgroundFullCloudinaryFetchIfNeeded();
+          await fetchCloudinaryProductsAdmin();
       }
     } catch (err) {
       console.warn('cloudinary fetch in admin failed:', err && err.message ? err.message : err);
@@ -428,25 +384,15 @@ router.put('/user/:username', asyncHandler(async (req, res) => {
 }));
 
 // ===================== DASHBOARD ANALYTICS API ===================== //
-// total users (unchanged)
 router.get('/total-users', asyncHandler(async (_, res) => {
     const count = await User.countDocuments();
     res.json({ count });
 }));
-
-// total-balance: use aggregation instead of loading all user docs into memory
 router.get('/total-balance', asyncHandler(async (_, res) => {
-    const agg = await User.aggregate([
-      { $group: { _id: null, total: { $sum: { $ifNull: ["$balance", 0] } } } }
-    ]).allowDiskUse(false);
-    const total = agg[0] ? agg[0].total : 0;
-    // ensure consistent formatting
-    if (typeof total === 'number' && typeof total.toFixed === 'function') {
-      return res.json({ total: total.toFixed(2) });
-    }
-    res.json({ total });
+    const users = await User.find({}, { balance: 1 }).lean();
+    const total = users.reduce((sum, u) => sum + (typeof u.balance === 'number' ? u.balance : 0), 0);
+    res.json({ total: total.toFixed(2) });
 }));
-
 router.get('/active-tasks', asyncHandler(async (_, res) => {
     const count = await Task.countDocuments({ status: { $in: ["Pending", "Active"] } });
     res.json({ count });
@@ -645,30 +591,86 @@ router.post('/settings', asyncHandler(async (req, res) => {
 }));
 
 // ===================== USERS API (RESTful) ===================== //
-// Paginated users endpoint to avoid sending entire collection at once
+// NOTE: This endpoint now supports server-side pagination, search (q), and newest-first sorting.
+// Query params:
+//  - q (optional): search term (matches username and phone, case-insensitive substring)
+//  - page (optional, default 1)
+//  - limit (optional, default 200, max 1000)
+//  - sort (optional): 'newest' (default) or 'oldest'
 router.get('/users', asyncHandler(async (req, res) => {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(500, parseInt(req.query.limit, 10) || 50);
-    const skip = (page - 1) * limit;
+    // Parse pagination & search params
+    let page = parseInt(req.query.page, 10);
+    if (isNaN(page) || page < 1) page = 1;
+    let limit = parseInt(req.query.limit, 10);
+    if (isNaN(limit) || limit < 1) limit = 200;
+    const MAX_LIMIT = 1000;
+    if (limit > MAX_LIMIT) limit = MAX_LIMIT;
 
-    const q = {};
-    if (req.query.q) {
-        const term = req.query.q;
-        q.$or = [
-            { username: new RegExp(term, 'i') },
-            { phone: new RegExp(term, 'i') }
+    const q = (req.query.q || '').toString().trim();
+    const sortParam = (req.query.sort || 'newest').toString().toLowerCase();
+
+    // Build Mongo query
+    const query = {};
+    if (q) {
+        const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        query.$or = [
+            { username: { $regex: regex } },
+            { phone: { $regex: regex } }
         ];
     }
 
-    // Exclude sensitive fields and limit fields returned
-    const projection = { password: 0 };
+    // Sorting: prefer createdAt if available, otherwise _id
+    const sort = {};
+    if (sortParam === 'oldest') {
+        // oldest first
+        if (User.schema && User.schema.paths && User.schema.paths.createdAt) {
+            sort.createdAt = 1;
+        } else {
+            sort._id = 1;
+        }
+    } else {
+        // newest first (default)
+        if (User.schema && User.schema.paths && User.schema.paths.createdAt) {
+            sort.createdAt = -1;
+        } else {
+            sort._id = -1;
+        }
+    }
 
-    const [users, total] = await Promise.all([
-        User.find(q, projection).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-        User.countDocuments(q)
+    // Projection: return a listing-friendly subset to keep payload small
+    const projection = {
+        username: 1,
+        phone: 1,
+        vipLevel: 1,
+        balance: 1,
+        status: 1,
+        currentSet: 1,
+        exchange: 1,
+        walletAddress: 1,
+        creditScore: 1,
+        createdAt: 1,
+        inviteCode: 1,
+        referredBy: 1,
+        token: 1
+    };
+
+    // Execute count and fetch in parallel
+    const [total, users] = await Promise.all([
+        User.countDocuments(query).exec(),
+        User.find(query, projection)
+            .sort(sort)
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .lean()
+            .exec()
     ]);
 
-    res.json({ users, page, limit, total });
+    res.json({
+        users: users || [],
+        page,
+        limit,
+        total: typeof total === 'number' ? total : 0
+    });
 }));
 
 router.post('/users', asyncHandler(async (req, res) => {
@@ -772,7 +774,6 @@ router.post('/vip/bulk-upgrade', asyncHandler(async (req, res) => {
     const { usernames } = req.body;
     if (!Array.isArray(usernames) || !usernames.length)
         return res.status(400).json({ success: false, message: 'Usernames required.' });
-    // Retrieve only matched users, then update via updateMany if possible (we preserve existing behavior)
     const users = await User.find({ username: { $in: usernames } });
     let changed = 0;
     for (const user of users) {
@@ -800,27 +801,9 @@ router.post('/vip/bulk-downgrade', asyncHandler(async (req, res) => {
     res.json({ success: true, changed });
 }));
 
-// Paginated products endpoint
-router.get('/products', asyncHandler(async (req, res) => {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(500, parseInt(req.query.limit, 10) || 50);
-    const skip = (page - 1) * limit;
-
-    const q = {};
-    if (req.query.q) {
-        const term = req.query.q;
-        q.$or = [
-            { name: new RegExp(term, 'i') },
-            { description: new RegExp(term, 'i') }
-        ];
-    }
-
-    const [products, total] = await Promise.all([
-        Product.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-        Product.countDocuments(q)
-    ]);
-
-    res.json({ products, page, limit, total });
+router.get('/products', asyncHandler(async (_, res) => {
+    const products = await Product.find({}).lean();
+    res.json(products);
 }));
 router.post('/products', asyncHandler(async (req, res) => {
     const { name, description, price, image } = req.body;
@@ -865,18 +848,9 @@ router.get('/products/:id', asyncHandler(async (req, res) => {
     res.json({ success: true, product });
 }));
 
-// Paginated combos endpoint
-router.get('/combos', asyncHandler(async (req, res) => {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(200, parseInt(req.query.limit, 10) || 50);
-    const skip = (page - 1) * limit;
-    const q = {};
-    if (req.query.q) q.username = new RegExp(req.query.q, 'i');
-    const [combos, total] = await Promise.all([
-        Combo.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-        Combo.countDocuments(q)
-    ]);
-    res.json({ combos, page, limit, total });
+router.get('/combos', asyncHandler(async (_, res) => {
+    const combos = await Combo.find({}).lean();
+    res.json(combos);
 }));
 router.post('/combos', asyncHandler(async (req, res) => {
     const { username, triggerTaskNumber, products } = req.body;
@@ -923,22 +897,9 @@ router.get('/combos/:id', asyncHandler(async (req, res) => {
     res.json({ success: true, combo });
 }));
 
-// Paginated tasks endpoint
-router.get('/tasks', asyncHandler(async (req, res) => {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(500, parseInt(req.query.limit, 10) || 50);
-    const skip = (page - 1) * limit;
-
-    const q = {};
-    if (req.query.status) q.status = req.query.status;
-    if (req.query.q) q.name = new RegExp(req.query.q, 'i');
-
-    const [tasks, total] = await Promise.all([
-        Task.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-        Task.countDocuments(q)
-    ]);
-
-    res.json({ tasks, page, limit, total });
+router.get('/tasks', asyncHandler(async (_, res) => {
+    const tasks = await Task.find({}).lean();
+    res.json(tasks);
 }));
 router.post('/tasks', asyncHandler(async (req, res) => {
     const { user, name, status } = req.body;
@@ -979,20 +940,10 @@ router.get('/tasks/:id', asyncHandler(async (req, res) => {
     res.json({ success: true, task });
 }));
 
-// Paginated transactions endpoint (returns deposits and withdrawals pages)
-router.get('/transactions', asyncHandler(async (req, res) => {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(200, parseInt(req.query.limit, 10) || 50);
-    const skip = (page - 1) * limit;
-
-    const [deposits, withdrawals, depositsTotal, withdrawalsTotal] = await Promise.all([
-        Transaction.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-        Withdrawal.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-        Transaction.countDocuments({}),
-        Withdrawal.countDocuments({})
-    ]);
-
-    res.json({ deposits, withdrawals, page, limit, depositsTotal, withdrawalsTotal });
+router.get('/transactions', asyncHandler(async (_, res) => {
+    const deposits = await Transaction.find({}).lean();
+    const withdrawals = await Withdrawal.find({}).lean();
+    res.json({ deposits, withdrawals });
 }));
 router.put('/transactions/:id', asyncHandler(async (req, res) => {
     const { id } = req.params;
@@ -1014,18 +965,9 @@ router.get('/transactions/:id', asyncHandler(async (req, res) => {
     res.json({ success: true, transaction: txn });
 }));
 
-// Paginated withdrawals endpoint
-router.get('/withdrawals', asyncHandler(async (req, res) => {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(200, parseInt(req.query.limit, 10) || 50);
-    const skip = (page - 1) * limit;
-
-    const [withdrawals, total] = await Promise.all([
-        Withdrawal.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-        Withdrawal.countDocuments({})
-    ]);
-
-    res.json({ withdrawals, page, limit, total });
+router.get('/withdrawals', asyncHandler(async (_, res) => {
+    const withdrawals = await Withdrawal.find({}).lean();
+    res.json(withdrawals);
 }));
 router.put('/withdrawals/:id', asyncHandler(async (req, res) => {
     const { id } = req.params;
@@ -1061,21 +1003,9 @@ router.get('/withdrawals/:id', asyncHandler(async (req, res) => {
     res.json({ success: true, withdrawal });
 }));
 
-// Paginated notifications endpoint
-router.get('/notifications', asyncHandler(async (req, res) => {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(200, parseInt(req.query.limit, 10) || 50);
-    const skip = (page - 1) * limit;
-
-    const q = {};
-    if (req.query.q) q.title = new RegExp(req.query.q, 'i');
-
-    const [notifications, total] = await Promise.all([
-        Notification.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-        Notification.countDocuments(q)
-    ]);
-
-    res.json({ notifications, page, limit, total });
+router.get('/notifications', asyncHandler(async (_, res) => {
+    const notifications = await Notification.find({}).lean();
+    res.json(notifications);
 }));
 router.post('/notifications', asyncHandler(async (req, res) => {
     const { title, message, status, recipients } = req.body;
