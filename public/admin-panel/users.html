@@ -541,7 +541,6 @@
       usersLoading = !!on;
       const el = document.getElementById('usersLoadingIndicator');
       if (el) el.className = on ? 'loading-indicator' : 'loading-indicator hidden';
-      // disable load more while loading
       const btn = document.getElementById('loadMoreUsersBtn');
       if (btn) btn.disabled = !!on;
     }
@@ -551,7 +550,9 @@
       if (usersLoading) return;
       setUsersLoading(true);
       try {
-        const url = `/admin/users?page=${page}&limit=${usersPerPage}`;
+        const q = document.getElementById('searchInput').value.trim();
+        let url = `/admin/users?page=${page}&limit=${usersPerPage}`;
+        if (q) url += `&q=${encodeURIComponent(q)}`;
         const res = await fetch(url, {
           headers: { 'x-admin-token': localStorage.getItem('adminToken') }
         });
@@ -560,28 +561,9 @@
         }
         const data = await res.json();
 
-        // Handle multiple possible response shapes:
-        // - { users: [...], page, limit, total }
-        // - array [...]
-        let users = [];
-        if (Array.isArray(data)) {
-          users = data;
-          usersTotal = data.length;
-        } else if (data && Array.isArray(data.users)) {
-          users = data.users;
-          usersTotal = typeof data.total === 'number' ? data.total : (append ? usersTotal + users.length : users.length);
-        } else if (data && Array.isArray(data.items)) {
-          users = data.items;
-          usersTotal = typeof data.total === 'number' ? data.total : users.length;
-        } else {
-          // fallback: try to find any array property
-          let found = null;
-          for (const k of Object.keys(data || {})) {
-            if (Array.isArray(data[k])) { found = data[k]; break; }
-          }
-          users = found || [];
-          usersTotal = typeof data.total === 'number' ? data.total : (append ? usersTotal + users.length : users.length);
-        }
+        // data shape: { users: [...], page, limit, total }
+        const users = Array.isArray(data.users) ? data.users : [];
+        const total = typeof data.total === 'number' ? data.total : (append ? usersTotal + users.length : users.length);
 
         if (append) {
           allUsers = allUsers.concat(users);
@@ -590,6 +572,7 @@
           allUsers = users;
           usersPage = page;
         }
+        usersTotal = total;
 
         renderUsers(allUsers);
 
@@ -604,8 +587,7 @@
         }
       } catch (err) {
         console.error('fetchUsers error', err);
-        // If unauthorized, prompt logout
-        if (err && String(err).toLowerCase().includes('unauthorized')) {
+        if (String(err).toLowerCase().includes('unauthorized')) {
           alert("Session expired or unauthorized. Please login again.");
           logout();
         } else {
@@ -619,7 +601,6 @@
     // Load more handler
     function loadMoreUsers() {
       if (usersLoading) return;
-      // fetch next page
       fetchUsers(usersPage + 1, true);
     }
 
@@ -686,7 +667,6 @@
         const data = await res.json();
         if (res.ok && data.success) {
           showToast('User task set reset!');
-          // refresh changed user in list
           await fetchUsers(1, false);
         } else {
           showToast('Failed to reset task set: ' + (data.message || 'Unknown error'));
@@ -715,47 +695,22 @@
       renderUsers(filtered);
     }
 
-    // Search: if query present, use server-side search; otherwise show loaded users
-    async function searchUsers() {
+    // Search: server-backed (calls /admin/users?q=...)
+    let _searchTimer = null;
+    function searchUsers() {
       const query = document.getElementById("searchInput").value.trim();
-      if (!query) {
-        // show loaded users and toggle load-more visibility
-        renderUsers(allUsers);
-        const loadMoreBtn = document.getElementById('loadMoreUsersBtn');
-        if (loadMoreBtn) {
-          loadMoreBtn.style.display = (allUsers.length < (usersTotal || 0)) ? 'inline-block' : 'none';
-        }
-        return;
-      }
-
-      // Debounce simple client-side: wait small delay before server call
-      if (this._searchTimer) clearTimeout(this._searchTimer);
-      this._searchTimer = setTimeout(async () => {
-        setUsersLoading(true);
-        try {
-          const res = await fetch(`/admin/users?q=${encodeURIComponent(query)}&page=1&limit=200`, {
-            headers: { "x-admin-token": localStorage.getItem('adminToken') }
-          });
-          if (!res.ok) throw new Error('Search failed');
-          const data = await res.json();
-          let results = [];
-          if (Array.isArray(data)) results = data;
-          else if (data && Array.isArray(data.users)) results = data.users;
-          else if (data && Array.isArray(data.items)) results = data.items;
-          else {
-            for (const k of Object.keys(data||{})) if (Array.isArray(data[k])) { results = data[k]; break; }
-          }
-          renderUsers(results);
-          // hide load more during search
+      if (_searchTimer) clearTimeout(_searchTimer);
+      _searchTimer = setTimeout(() => {
+        if (!query) {
+          // show loaded users and restore load-more
+          renderUsers(allUsers);
           const loadMoreBtn = document.getElementById('loadMoreUsersBtn');
-          if (loadMoreBtn) loadMoreBtn.style.display = 'none';
-        } catch (err) {
-          console.error('searchUsers error', err);
-          showToast('Search failed');
-        } finally {
-          setUsersLoading(false);
+          if (loadMoreBtn) loadMoreBtn.style.display = (allUsers.length < (usersTotal || 0)) ? 'inline-block' : 'none';
+          return;
         }
-      }, 200);
+        // request server search page 1
+        fetchUsers(1, false);
+      }, 220);
     }
 
     function showAddUserModal() {
@@ -1159,7 +1114,7 @@
 
         window._currentDetailUser = username;
 
-        // update counts (non-blocking)
+        // update counts (non-blocking) using paginated endpoints (fast)
         fetchUserCombosCount(username).then(count => {
           document.getElementById('combosSummary').textContent = count ? `(${count} combo${count>1?'s':''})` : '(no combos)';
         }).catch(()=>{});
@@ -1179,13 +1134,13 @@
     let comboProductsList = [];
     let comboSelectedProducts = [];
 
+    // Efficient count by asking server for page=1&limit=1 and reading total
     async function fetchUserCombosCount(username) {
       try {
-        const res = await fetch('/admin/combos', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/combos?username=${encodeURIComponent(username)}&page=1&limit=1`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) return 0;
-        const combos = await res.json();
-        if (!Array.isArray(combos)) return 0;
-        return combos.filter(c => (c.username === username)).length;
+        const data = await res.json();
+        return typeof data.total === 'number' ? data.total : 0;
       } catch { return 0; }
     }
 
@@ -1193,16 +1148,19 @@
       const el = document.getElementById('detailCombosList');
       el.textContent = 'Loading combos…';
       try {
-        const res = await fetch('/admin/combos', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/combos?username=${encodeURIComponent(username)}&page=1&limit=200`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) throw new Error('Failed to fetch combos');
-        const combos = await res.json();
-        const my = (Array.isArray(combos) ? combos : []).filter(c => c.username === username);
+        const data = await res.json();
+        const my = Array.isArray(data.items) ? data.items : [];
         if (!my.length) {
           el.innerHTML = '<div class="muted">No combos assigned</div>';
           return;
         }
-        // show newest first (if combos include createdAt use it)
-        my.sort((a,b) => (b.createdAt||0)-(a.createdAt||0));
+        my.sort((a,b) => {
+          const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          return tb - ta;
+        });
         el.innerHTML = my.map(c => {
           const id = c.id || c._id || '';
           const products = (Array.isArray(c.products) ? c.products : []).map(p => `<div style="display:flex;gap:8px;align-items:center"><img src="${p.image}" style="width:34px;height:34px;object-fit:cover;border-radius:4px"/> <div><div style="font-weight:600">${escapeHtml(p.name || '')}</div><div class="muted">£${Number(p.price||0).toFixed(2)} | £${Number(p.commission||0).toFixed(2)}</div></div></div>`).join('');
@@ -1339,20 +1297,20 @@
 
     async function editComboInDetail(comboId) {
       try {
-        const res = await fetch('/admin/combos', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/combos?username=&page=1&limit=500`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) throw new Error();
-        const combos = await res.json();
-        const combo = (Array.isArray(combos) ? combos : []).find(c => (c.id === comboId || c._id === comboId));
+        const data = await res.json();
+        const combos = Array.isArray(data.items) ? data.items : [];
+        const combo = combos.find(c => (c.id === comboId || c._id === comboId));
         if (!combo) { showToast('Combo not found'); return; }
-        // prefill modal with combo data
         comboSelectedProducts = (Array.isArray(combo.products) ? combo.products.map(p => ({...p})) : []);
-        comboProductsList = []; // will be fetched if user re-browses products
+        comboProductsList = [];
         document.getElementById("combo_modalUsername").value = combo.username;
         document.getElementById("combo_modalTriggerTask").value = combo.triggerTaskNumber;
         document.getElementById("comboModal").style.display = 'flex';
         renderSelectedProductsTable();
-        // On submit, we'll update existing combo (simple approach: delete then create if no update endpoint)
-        // For simplicity, we'll call PUT if backend supports /admin/combos/:id
+
+        // override submit to perform update
         document.getElementById("comboForm").onsubmit = async function(ev){
           ev.preventDefault();
           const username = document.getElementById("combo_modalUsername").value.trim();
@@ -1368,7 +1326,6 @@
             showToast("Combo updated!");
             closeComboModal();
             await loadCombosForDetail(username);
-            // restore original submit handler
             document.getElementById("comboForm").onsubmit = comboFormSubmitHandler;
           } catch (err) {
             console.error(err);
@@ -1400,22 +1357,13 @@
       }
     }
 
-    // --- Deposits: show only admin add-balance history ---
+    // --- Deposits: show only admin add-balance history (use paginated transactions) ---
     async function fetchUserDepositsCount(username) {
       try {
-        const res = await fetch('/admin/transactions', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/transactions?username=${encodeURIComponent(username)}&type=admin_add_balance&page=1&limit=1`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) return 0;
-        const all = await res.json();
-        // /admin/transactions returns merged deposits/withdrawals or object; handle both
-        let deposits = [];
-        if (Array.isArray(all)) deposits = all;
-        else deposits = Array.isArray(all.deposits) ? all.deposits : [];
-        // include transactions with type 'admin_add_balance' or similar
-        const filtered = deposits.filter(d => {
-          const t = (d.type || '').toString().toLowerCase();
-          return (d.username === username || d.user === username) && (t.includes('admin_add') || t.includes('admin_add_balance') || t.includes('admin_add_balance'));
-        });
-        return filtered.length;
+        const data = await res.json();
+        return typeof data.total === 'number' ? data.total : 0;
       } catch { return 0; }
     }
 
@@ -1423,23 +1371,16 @@
       const el = document.getElementById('detailDepositsList');
       el.innerHTML = '<li class="muted">Loading deposits…</li>';
       try {
-        const res = await fetch('/admin/transactions', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/transactions?username=${encodeURIComponent(username)}&type=admin_add_balance&page=1&limit=200`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) throw new Error('Failed');
-        const all = await res.json();
-        let deposits = [];
-        if (Array.isArray(all)) deposits = all;
-        else deposits = Array.isArray(all.deposits) ? all.deposits : [];
-        // Filter admin add balance transactions for this user
-        const filtered = deposits.filter(d => {
-          const t = (d.type || '').toString().toLowerCase();
-          return (d.username === username || d.user === username) && (t.includes('admin_add') || t.includes('admin_add_balance') || t.includes('add_balance'));
-        });
-        filtered.sort((a,b) => new Date(b.createdAt || b.date || 0) - new Date(a.createdAt || a.date || 0));
-        if (!filtered.length) {
+        const data = await res.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        items.sort((a,b) => new Date(b.createdAt || b.date || 0) - new Date(a.createdAt || a.date || 0));
+        if (!items.length) {
           el.innerHTML = '<li class="muted">No admin balance actions found</li>';
           return;
         }
-        el.innerHTML = filtered.map(d => {
+        el.innerHTML = items.map(d => {
           const amount = Number(d.amount || d.value || 0).toFixed(2);
           const date = d.createdAt ? new Date(d.createdAt).toLocaleString() : (d.date ? new Date(d.date).toLocaleString() : '');
           return `<li><div><strong>$${amount}</strong> — <span class="muted">${date}</span></div></li>`;
@@ -1452,11 +1393,10 @@
 
     async function fetchUserWithdrawalsCount(username) {
       try {
-        const res = await fetch('/admin/withdrawals', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/withdrawals?username=${encodeURIComponent(username)}&page=1&limit=1`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) return 0;
-        const all = await res.json();
-        const filtered = (Array.isArray(all) ? all : []).filter(w => (w.username === username || w.user === username));
-        return filtered.length;
+        const data = await res.json();
+        return typeof data.total === 'number' ? data.total : 0;
       } catch { return 0; }
     }
 
@@ -1464,16 +1404,16 @@
       const el = document.getElementById('detailWithdrawalsList');
       el.innerHTML = '<li class="muted">Loading withdrawals…</li>';
       try {
-        const res = await fetch('/admin/withdrawals', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/withdrawals?username=${encodeURIComponent(username)}&page=1&limit=200`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) throw new Error('Failed');
-        const all = await res.json();
-        const filtered = (Array.isArray(all) ? all : []).filter(w => (w.username === username || w.user === username));
-        filtered.sort((a,b) => new Date(b.createdAt || b.requestedAt || 0) - new Date(a.createdAt || a.requestedAt || 0));
-        if (!filtered.length) {
+        const data = await res.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        items.sort((a,b) => new Date(b.createdAt || b.requestedAt || 0) - new Date(a.createdAt || a.requestedAt || 0));
+        if (!items.length) {
           el.innerHTML = '<li class="muted">No withdrawals</li>';
           return;
         }
-        el.innerHTML = filtered.map((w, idx) => {
+        el.innerHTML = items.map((w, idx) => {
           const amount = Number(w.amount||0).toFixed(2);
           const status = w.status || 'Pending';
           const id = w._id || w.id || w.transactionId || idx;
@@ -1489,14 +1429,172 @@
               <button class="action-btn" onclick="rejectWithdrawalInDetail('${escapeHtml(String(id))}')"><i class="fa fa-times"></i></button>
             </div>
           </li>`;
-        }).join('');``` 
+        }).join('');
+      } catch (err) {
+        console.error(err);
+        el.innerHTML = '<li class="muted">Failed to load withdrawals</li>';
+      }
+    }
 
-(Truncated here in the preview due to size — the full file above continues with the functions shown earlier in the original file and includes the new pagination/search changes I described.)
+    async function approveWithdrawalInDetail(id) {
+      try {
+        const res = await fetch(`/admin/withdrawals/${encodeURIComponent(id)}/approve`, {
+          method: 'PATCH',
+          headers: { 'x-admin-token': localStorage.getItem('adminToken') }
+        });
+        if (!res.ok) throw new Error('approve failed');
+        showToast('Withdrawal approved');
+        await loadWithdrawalsForDetail(window._currentDetailUser);
+      } catch (err) {
+        console.error(err);
+        showToast('Failed to approve');
+      }
+    }
+    async function rejectWithdrawalInDetail(id) {
+      try {
+        const res = await fetch(`/admin/withdrawals/${encodeURIComponent(id)}/reject`, {
+          method: 'PATCH',
+          headers: { 'x-admin-token': localStorage.getItem('adminToken') }
+        });
+        if (!res.ok) throw new Error('reject failed');
+        showToast('Withdrawal rejected');
+        await loadWithdrawalsForDetail(window._currentDetailUser);
+      } catch (err) {
+        console.error(err);
+        showToast('Failed to reject');
+      }
+    }
 
-Notes and next steps
-- Replace your current users.html with this file.
-- Confirm your server /admin/users endpoint (the one I modified earlier) is deployed and returns the paginated shape { users, page, limit, total } — if it does, this client will show the first page immediately.
-- If your server still returns an unpaged array, the client handles that too (it falls back).
-- If you want, I can add standard pagination UI (Prev/Next + page numbers) instead of Load more, or implement infinite scrolling.
+    // --- Inline Add Balance form for detail (keeps inside drawer) ---
+    function openAddBalanceForDetail() {
+      const container = document.getElementById('inlineForms');
+      container.innerHTML = '';
+      const username = window._currentDetailUser || '';
+      const form = document.createElement('div');
+      form.innerHTML = `
+        <div class="user-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div><strong>Add balance (admin)</strong><div class="muted">Will create an admin add-balance transaction</div></div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input id="inline_add_amount" class="small" type="number" min="0.01" step="0.01" placeholder="Amount" />
+              <button class="action-btn action-primary" id="inline_add_submit">Add</button>
+              <button class="action-btn" id="inline_add_cancel">Cancel</button>
+            </div>
+          </div>
+        </div>
+      `;
+      container.appendChild(form);
+      document.getElementById('inline_add_cancel').onclick = () => { container.innerHTML = ''; };
+      document.getElementById('inline_add_submit').onclick = async () => {
+        const amt = Number(document.getElementById('inline_add_amount').value);
+        if (isNaN(amt) || amt <= 0) { showToast('Enter positive amount'); return; }
+        try {
+          const res = await fetch('/admin/add-balance', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-admin-token': localStorage.getItem('adminToken') },
+            body: JSON.stringify({ username, amount: amt })
+          });
+          if (!res.ok) {
+            const data = await res.json().catch(()=>({}));
+            throw new Error(data.message || 'Failed');
+          }
+          showToast('Balance added');
+          container.innerHTML = '';
+          await loadDepositsForDetail(username);
+          fetchUsers(1, false);
+        } catch (err) {
+          console.error(err);
+          showToast('Failed to add balance');
+        }
+      };
+    }
 
-Would you like the full, untruncated file sent as a direct downloadable file or pasted entirely here again?
+    // --- VIP update in-drawer using global vipModal ---
+    function openUpdateVipForDetail() {
+      document.getElementById('vip_modalUsername').value = window._currentDetailUser || '';
+      document.getElementById('vip_modalVipLevel').value = document.getElementById('detailVip').textContent || 1;
+      document.getElementById('vipModal').style.display = 'flex';
+    }
+    function openVipModal(username) {
+      document.getElementById('vip_modalUsername').value = username || '';
+      const user = allUsers.find(u => u.username === username) || {};
+      document.getElementById('vip_modalVipLevel').value = user.vipLevel || 1;
+      document.getElementById('vipModal').style.display = 'flex';
+    }
+    function closeVipModal() {
+      document.getElementById('vipModal').style.display = 'none';
+    }
+    document.getElementById('vipForm').onsubmit = async function(e){
+      e.preventDefault();
+      const username = document.getElementById('vip_modalUsername').value;
+      const vip = Number(document.getElementById('vip_modalVipLevel').value);
+      if (!username || isNaN(vip)) return;
+      try {
+        const res = await fetch('/admin/update-vip', {
+          method: 'POST',
+          headers: { "Content-Type": "application/json", "x-admin-token": localStorage.getItem('adminToken') },
+          body: JSON.stringify({ username, vip })
+        });
+        if (!res.ok) throw new Error('failed');
+        showToast('VIP updated');
+        closeVipModal();
+        if (window._currentDetailUser === username) await loadUserDetail(username);
+        fetchUsers(1, false);
+      } catch (err) {
+        console.error(err);
+        showToast('Failed to update VIP');
+      }
+    };
+
+    // Toggle suspend from detail header
+    async function toggleSuspendFromDetail() {
+      const username = window._currentDetailUser;
+      if (!username) return;
+      if (!confirm('Toggle suspend/unsuspend for ' + username + '?')) return;
+      await suspendUser(username);
+      await loadUserDetail(username);
+    }
+
+    async function deleteUserFromDetail() {
+      const username = window._currentDetailUser;
+      if (!username) return;
+      if (!confirm('Delete user ' + username + '? This is irreversible.')) return;
+      await deleteUser(username);
+      closeUserDetail();
+    }
+
+    // Edit user from detail (open user modal prefilled)
+    function editUserFromDetail() {
+      const username = window._currentDetailUser;
+      if (!username) return editUser('');
+      editUser(username);
+    }
+
+    // --- Initial load ---
+    fetchUsers(1, false);
+
+    // --- small helpers ---
+    function showToast(msg) {
+      const toast = document.getElementById("toast");
+      toast.textContent = msg;
+      toast.className = "toast show";
+      setTimeout(() => { toast.className = "toast"; }, 3000);
+    }
+    function logout() {
+      localStorage.removeItem("adminToken");
+      window.location.href = "/admin-panel/login.html";
+    }
+
+    // close drawer-scoped modals on outside click
+    window.addEventListener('click', function(evt){
+      const comboModal = document.getElementById('comboModal');
+      if (comboModal && comboModal.style.display === 'flex' && evt.target === comboModal) comboModal.style.display = 'none';
+      const userModal = document.getElementById('userModal');
+      if (userModal && userModal.style.display === 'flex' && evt.target === userModal) userModal.style.display = 'none';
+      const vipModal = document.getElementById('vipModal');
+      if (vipModal && vipModal.style.display === 'flex' && evt.target === vipModal) vipModal.style.display = 'none';
+    });
+
+  </script>
+</body>
+</html>
