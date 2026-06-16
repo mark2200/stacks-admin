@@ -46,6 +46,24 @@ require("dotenv").config();
 const app = express();
 
 // ===============================
+// PERFORMANCE: compression & timing
+// ===============================
+const compression = require("compression");
+// Enable GZIP/deflate for responses (reduces large JSON payload transfer time)
+app.use(compression());
+
+// Lightweight request timing logger to help spot slow endpoints
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    const ip = req.ip || (req.headers['x-forwarded-for'] || req.connection.remoteAddress);
+    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms - ${ip}`);
+  });
+  next();
+});
+
+// ===============================
 // 🩺 Health Check
 // ===============================
 app.get("/health", require("./src/health"));
