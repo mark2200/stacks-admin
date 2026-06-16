@@ -1272,6 +1272,7 @@
       renderSelectedProductsTable();
     };
 
+    // --- FIXED: try /admin/combos then fallback to /admin/assign-combo if 404 ---
     document.getElementById("comboForm").onsubmit = async function(e){
       e.preventDefault();
       const username = document.getElementById("combo_modalUsername").value.trim();
@@ -1280,12 +1281,34 @@
       if (!comboSelectedProducts.length) { showToast("Pick at least one product"); return; }
       const products = comboSelectedProducts.map(p => ({ name: p.name, image: p.image, price: Number(p.price||0), commission: Number(p.commission||0) }));
       try {
-        const res = await fetch('/admin/combos', {
+        const payload = { username, triggerTaskNumber, products };
+        // attempt primary endpoint
+        let res = await fetch('/admin/combos', {
           method: 'POST',
           headers: { "Content-Type": "application/json", "x-admin-token": localStorage.getItem('adminToken') },
-          body: JSON.stringify({ username, triggerTaskNumber, products })
+          body: JSON.stringify(payload)
         });
-        if (!res.ok) throw new Error('Failed to save combo');
+
+        // if primary not found, fallback to legacy/alternate endpoint
+        if (res.status === 404) {
+          console.warn('POST /admin/combos returned 404, retrying /admin/assign-combo');
+          res = await fetch('/admin/assign-combo', {
+            method: 'POST',
+            headers: { "Content-Type": "application/json", "x-admin-token": localStorage.getItem('adminToken') },
+            body: JSON.stringify(payload)
+          });
+        }
+
+        // read response body safely
+        let responseBody = null;
+        try { responseBody = await res.clone().json().catch(()=>null); } catch(e){ responseBody = null; }
+
+        if (!res.ok) {
+          const msg = (responseBody && responseBody.message) ? responseBody.message : (res.statusText || 'Failed to save combo');
+          showToast("Failed to assign combo: " + msg);
+          return;
+        }
+
         showToast("Combo assigned!");
         closeComboModal();
         await loadCombosForDetail(username);
