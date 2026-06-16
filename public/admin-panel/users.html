@@ -217,7 +217,8 @@
           <input type="text" id="searchInput" placeholder="Search by username or phone..." oninput="searchUsers()" />
           <button class="add-btn" onclick="showAddUserModal()"><i class="fa fa-user-plus"></i> Add User</button>
           <button class="export-btn" onclick="exportUsersCSV()"><i class="fa fa-download"></i> Export CSV</button>
-          <button class="export-btn" onclick="openVipModalBulk()" title="Manage VIPs"><i class="fa fa-star"></i> VIP</button>
+          <button class="export-btn" id="loadMoreUsersBtn" onclick="loadMoreUsers()" style="display:none;"><i class="fa fa-plus"></i> Load more</button>
+          <span id="usersLoadingIndicator" class="loading-indicator hidden">Loading…</span>
         </div>
         <div class="table-responsive">
           <table>
@@ -524,70 +525,83 @@
     let editingOriginalUsername = null; // stores the original username while editing
     let allUsers = [];
 
+    // pagination state for incremental loading
+    let usersPage = 1;
+    const usersPerPage = 100; // tune as needed
+    let usersTotal = 0;
+    let usersLoading = false;
+
     // small helper to escape single quotes when embedding usernames into inline onclick handlers
     function escapeForInline(s = "") {
       return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     }
 
-    // ========= SAFE fetchUsers: prevents logout on 304 and only logs out on 401/403 =========
-    function fetchUsers() {
-      (async () => {
-        try {
-          const res = await fetch('/admin/users', {
-            headers: { 'x-admin-token': localStorage.getItem('adminToken') || '' },
-            cache: 'no-store',        // force fresh response so server returns JSON instead of 304
-            credentials: 'same-origin'
-          });
+    // show/hide loading indicator
+    function setUsersLoading(on) {
+      usersLoading = !!on;
+      const el = document.getElementById('usersLoadingIndicator');
+      if (el) el.className = on ? 'loading-indicator' : 'loading-indicator hidden';
+      const btn = document.getElementById('loadMoreUsersBtn');
+      if (btn) btn.disabled = !!on;
+    }
 
-          // Only treat explicit auth failure as reason to logout
-          if (res.status === 401 || res.status === 403) {
-            alert("Session expired or unauthorized. Please login again.");
-            logout();
-            return;
-          }
-
-          // For other non-OK statuses, show a message but do not clear token
-          if (!res.ok) {
-            console.warn('fetchUsers: non-ok status', res.status);
-            showToast('Failed to load users (server returned ' + res.status + ').');
-            return;
-          }
-
-          const data = await res.json();
-
-          // Support both legacy array and paginated { users: [] } shapes
-          if (Array.isArray(data)) {
-            allUsers = data;
-          } else if (data && Array.isArray(data.users)) {
-            allUsers = data.users;
-          } else if (data && Array.isArray(data.items)) {
-            // if backend returns { items, total }
-            allUsers = data.items;
-          } else {
-            allUsers = data.users || [];
-          }
-
-          renderUsers(allUsers);
-
-          // If this page was opened with #user=..., auto-open that user in drawer
-          try {
-            const hash = window.location.hash || '';
-            if (hash && hash.includes('user=')) {
-              const params = new URLSearchParams(hash.replace(/^#/, ''));
-              const u = params.get('user');
-              if (u) {
-                // small timeout to ensure UI rendered
-                setTimeout(() => {
-                  openUserPage(decodeURIComponent(u));
-                }, 240);
-              }
-            }
-          } catch (e) {}
-        } catch (err) {
-          console.error('fetchUsers error', err);
-          showToast('Network error while fetching users.');
+    // Fetch one page of users from server (uses server-side pagination)
+    async function fetchUsers(page = 1, append = false) {
+      if (usersLoading) return;
+      setUsersLoading(true);
+      try {
+        const q = document.getElementById('searchInput').value.trim();
+        let url = `/admin/users?page=${page}&limit=${usersPerPage}`;
+        if (q) url += `&q=${encodeURIComponent(q)}`;
+        const res = await fetch(url, {
+          headers: { 'x-admin-token': localStorage.getItem('adminToken') }
+        });
+        if (!res.ok) {
+          throw new Error('Unauthorized or fetch failed');
         }
-      })();
+        const data = await res.json();
+
+        // data shape: { users: [...], page, limit, total }
+        const users = Array.isArray(data.users) ? data.users : [];
+        const total = typeof data.total === 'number' ? data.total : (append ? usersTotal + users.length : users.length);
+
+        if (append) {
+          allUsers = allUsers.concat(users);
+          usersPage = page;
+        } else {
+          allUsers = users;
+          usersPage = page;
+        }
+        usersTotal = total;
+
+        renderUsers(allUsers);
+
+        // Show/Hide "Load more" button
+        const loadMoreBtn = document.getElementById('loadMoreUsersBtn');
+        if (loadMoreBtn) {
+          if (allUsers.length < (usersTotal || 0)) {
+            loadMoreBtn.style.display = "inline-block";
+          } else {
+            loadMoreBtn.style.display = "none";
+          }
+        }
+      } catch (err) {
+        console.error('fetchUsers error', err);
+        if (String(err).toLowerCase().includes('unauthorized')) {
+          alert("Session expired or unauthorized. Please login again.");
+          logout();
+        } else {
+          showToast('Failed to load users (see console).');
+        }
+      } finally {
+        setUsersLoading(false);
+      }
+    }
+
+    // Load more handler
+    function loadMoreUsers() {
+      if (usersLoading) return;
+      fetchUsers(usersPage + 1, true);
     }
 
     function renderUsers(users) {
@@ -603,7 +617,7 @@
         table.innerHTML += `
           <tr>
             <td><input type="checkbox" onclick="selectUser('${escUsername}', this)" ${checked}></td>
-            <td>${user.id || user._id || ""}</td>
+            <td>${user.id || (user._id ? user._id : '')}</td>
             <td><a class="user-link" href="#" onclick="openUserPage('${escUsername}'); return false;">${user.username}</a></td>
             <td>${user.phone || ""}</td>
             <td>${user.vipLevel || ""}</td>
@@ -653,7 +667,7 @@
         const data = await res.json();
         if (res.ok && data.success) {
           showToast('User task set reset!');
-          fetchUsers();
+          await fetchUsers(1, false);
         } else {
           showToast('Failed to reset task set: ' + (data.message || 'Unknown error'));
         }
@@ -681,13 +695,22 @@
       renderUsers(filtered);
     }
 
+    // Search: server-backed (calls /admin/users?q=...)
+    let _searchTimer = null;
     function searchUsers() {
-      const query = document.getElementById("searchInput").value.toLowerCase();
-      const filtered = allUsers.filter(user =>
-        user.username.toLowerCase().includes(query) ||
-        (user.phone && user.phone.includes(query))
-      );
-      renderUsers(filtered);
+      const query = document.getElementById("searchInput").value.trim();
+      if (_searchTimer) clearTimeout(_searchTimer);
+      _searchTimer = setTimeout(() => {
+        if (!query) {
+          // show loaded users and restore load-more
+          renderUsers(allUsers);
+          const loadMoreBtn = document.getElementById('loadMoreUsersBtn');
+          if (loadMoreBtn) loadMoreBtn.style.display = (allUsers.length < (usersTotal || 0)) ? 'inline-block' : 'none';
+          return;
+        }
+        // request server search page 1
+        fetchUsers(1, false);
+      }, 220);
     }
 
     function showAddUserModal() {
@@ -843,14 +866,15 @@
       }
       editingOriginalUsername = null;
       closeUserModal();
-      fetchUsers();
+      // refresh list: re-fetch first page
+      fetchUsers(1, false);
     };
 
     function editUser(username) {
       const user = allUsers.find(u => u.username === username);
       if (!user) {
         showToast("User not found or data stale. Refreshing list...");
-        fetchUsers();
+        fetchUsers(1, false);
         return;
       }
       editingOriginalUsername = user.username;
@@ -904,7 +928,7 @@
           return;
         }
         showToast(data.status === 'Active' ? "User unsuspended." : "User suspended.");
-        fetchUsers();
+        fetchUsers(1, false);
       } catch (err) {
         showToast("Network/server error when suspending/unsuspending user.");
       }
@@ -924,7 +948,7 @@
         }
         selectedUsers.delete(username);
         showToast("User deleted.");
-        fetchUsers();
+        fetchUsers(1, false);
       } catch (err) {
         showToast("Network/server error when deleting user.");
       }
@@ -945,7 +969,7 @@
         }
       }
       showToast(failed > 0 ? `Some users failed to suspend/unsuspend.` : "Selected users suspended/unsuspended.");
-      fetchUsers();
+      fetchUsers(1, false);
       selectedUsers.clear();
     }
     async function bulkDeleteUsers() {
@@ -965,7 +989,7 @@
       }
       selectedUsers.clear();
       showToast(failed > 0 ? "Some users failed to delete." : "Selected users deleted.");
-      fetchUsers();
+      fetchUsers(1, false);
     }
 
     function exportUsersCSV() {
@@ -976,7 +1000,7 @@
         "Created At","Task Count Today","Tasks Completed In Set","Set Starting Balance","Token","Credit Score"
       ];
       const rows = allUsers.map(u => ([
-        u.id || u._id || "",
+        u.id || (u._id ? u._id : ""),
         u.username || "",
         u.phone || "",
         u.vipLevel != null ? u.vipLevel : "",
@@ -1090,7 +1114,7 @@
 
         window._currentDetailUser = username;
 
-        // update counts (non-blocking)
+        // update counts (non-blocking) using paginated endpoints (fast)
         fetchUserCombosCount(username).then(count => {
           document.getElementById('combosSummary').textContent = count ? `(${count} combo${count>1?'s':''})` : '(no combos)';
         }).catch(()=>{});
@@ -1110,13 +1134,13 @@
     let comboProductsList = [];
     let comboSelectedProducts = [];
 
+    // Efficient count by asking server for page=1&limit=1 and reading total
     async function fetchUserCombosCount(username) {
       try {
-        const res = await fetch('/admin/combos', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/combos?username=${encodeURIComponent(username)}&page=1&limit=1`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) return 0;
-        const combos = await res.json();
-        if (!Array.isArray(combos)) return 0;
-        return combos.filter(c => (c.username === username)).length;
+        const data = await res.json();
+        return typeof data.total === 'number' ? data.total : 0;
       } catch { return 0; }
     }
 
@@ -1124,15 +1148,19 @@
       const el = document.getElementById('detailCombosList');
       el.textContent = 'Loading combos…';
       try {
-        const res = await fetch('/admin/combos', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/combos?username=${encodeURIComponent(username)}&page=1&limit=200`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) throw new Error('Failed to fetch combos');
-        const combos = await res.json();
-        const my = (Array.isArray(combos) ? combos : []).filter(c => c.username === username);
+        const data = await res.json();
+        const my = Array.isArray(data.items) ? data.items : [];
         if (!my.length) {
           el.innerHTML = '<div class="muted">No combos assigned</div>';
           return;
         }
-        my.sort((a,b) => (b.createdAt||0)-(a.createdAt||0));
+        my.sort((a,b) => {
+          const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          return tb - ta;
+        });
         el.innerHTML = my.map(c => {
           const id = c.id || c._id || '';
           const products = (Array.isArray(c.products) ? c.products : []).map(p => `<div style="display:flex;gap:8px;align-items:center"><img src="${p.image}" style="width:34px;height:34px;object-fit:cover;border-radius:4px"/> <div><div style="font-weight:600">${escapeHtml(p.name || '')}</div><div class="muted">£${Number(p.price||0).toFixed(2)} | £${Number(p.commission||0).toFixed(2)}</div></div></div>`).join('');
@@ -1244,7 +1272,6 @@
       renderSelectedProductsTable();
     };
 
-    // IMPORTANT CHANGE: POST to /admin/assign-combo (deployed server expects this) for creation.
     document.getElementById("comboForm").onsubmit = async function(e){
       e.preventDefault();
       const username = document.getElementById("combo_modalUsername").value.trim();
@@ -1253,17 +1280,12 @@
       if (!comboSelectedProducts.length) { showToast("Pick at least one product"); return; }
       const products = comboSelectedProducts.map(p => ({ name: p.name, image: p.image, price: Number(p.price||0), commission: Number(p.commission||0) }));
       try {
-        // Use /admin/assign-combo to create (this endpoint exists on deployed server)
-        const res = await fetch('/admin/assign-combo', {
+        const res = await fetch('/admin/combos', {
           method: 'POST',
           headers: { "Content-Type": "application/json", "x-admin-token": localStorage.getItem('adminToken') },
           body: JSON.stringify({ username, triggerTaskNumber, products })
         });
-        if (!res.ok) {
-          const data = await res.json().catch(()=>({}));
-          showToast("Failed to assign combo: " + (data.message || res.statusText));
-          return;
-        }
+        if (!res.ok) throw new Error('Failed to save combo');
         showToast("Combo assigned!");
         closeComboModal();
         await loadCombosForDetail(username);
@@ -1275,19 +1297,20 @@
 
     async function editComboInDetail(comboId) {
       try {
-        const res = await fetch('/admin/combos', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/combos?username=&page=1&limit=500`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) throw new Error();
-        const combos = await res.json();
-        const combo = (Array.isArray(combos) ? combos : []).find(c => (c.id === comboId || c._id === comboId));
+        const data = await res.json();
+        const combos = Array.isArray(data.items) ? data.items : [];
+        const combo = combos.find(c => (c.id === comboId || c._id === comboId));
         if (!combo) { showToast('Combo not found'); return; }
-        // prefill modal with combo data
         comboSelectedProducts = (Array.isArray(combo.products) ? combo.products.map(p => ({...p})) : []);
-        comboProductsList = []; // will be fetched if user re-browses products
+        comboProductsList = [];
         document.getElementById("combo_modalUsername").value = combo.username;
         document.getElementById("combo_modalTriggerTask").value = combo.triggerTaskNumber;
         document.getElementById("comboModal").style.display = 'flex';
         renderSelectedProductsTable();
-        // On submit, we'll update existing combo (simple approach: PUT /admin/combos/:id)
+
+        // override submit to perform update
         document.getElementById("comboForm").onsubmit = async function(ev){
           ev.preventDefault();
           const username = document.getElementById("combo_modalUsername").value.trim();
@@ -1303,33 +1326,7 @@
             showToast("Combo updated!");
             closeComboModal();
             await loadCombosForDetail(username);
-            // restore original submit handler
-            document.getElementById("comboForm").onsubmit = async function(e){
-              e.preventDefault();
-              const username2 = document.getElementById("combo_modalUsername").value.trim();
-              const triggerTaskNumber2 = Number(document.getElementById("combo_modalTriggerTask").value);
-              if (!username2 || !triggerTaskNumber2) { showToast("Username and trigger required"); return; }
-              if (!comboSelectedProducts.length) { showToast("Pick at least one product"); return; }
-              const products2 = comboSelectedProducts.map(p => ({ name: p.name, image: p.image, price: Number(p.price||0), commission: Number(p.commission||0) }));
-              try {
-                const res2 = await fetch('/admin/assign-combo', {
-                  method: 'POST',
-                  headers: { "Content-Type": "application/json", "x-admin-token": localStorage.getItem('adminToken') },
-                  body: JSON.stringify({ username: username2, triggerTaskNumber: triggerTaskNumber2, products: products2 })
-                });
-                if (!res2.ok) {
-                  const data = await res2.json().catch(()=>({}));
-                  showToast("Failed to assign combo: " + (data.message || res2.statusText));
-                  return;
-                }
-                showToast("Combo assigned!");
-                closeComboModal();
-                await loadCombosForDetail(username2);
-              } catch (err) {
-                console.error(err);
-                showToast("Failed to assign combo");
-              }
-            };
+            document.getElementById("comboForm").onsubmit = comboFormSubmitHandler;
           } catch (err) {
             console.error(err);
             showToast("Failed to update combo");
@@ -1340,6 +1337,9 @@
         showToast("Failed to load combo for edit");
       }
     }
+
+    // save original handler to restore after edit
+    const comboFormSubmitHandler = document.getElementById("comboForm").onsubmit;
 
     async function deleteComboInDetail(comboId) {
       if (!confirm("Delete this combo?")) return;
@@ -1357,20 +1357,13 @@
       }
     }
 
-    // --- Deposits: show only admin add-balance history ---
+    // --- Deposits: show only admin add-balance history (use paginated transactions) ---
     async function fetchUserDepositsCount(username) {
       try {
-        const res = await fetch('/admin/transactions', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/transactions?username=${encodeURIComponent(username)}&type=admin_add_balance&page=1&limit=1`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) return 0;
-        const all = await res.json();
-        let deposits = [];
-        if (Array.isArray(all)) deposits = all;
-        else deposits = Array.isArray(all.deposits) ? all.deposits : [];
-        const filtered = deposits.filter(d => {
-          const t = (d.type || '').toString().toLowerCase();
-          return (d.username === username || d.user === username) && (t.includes('admin_add') || t.includes('admin_add_balance') || t.includes('admin_add_balance'));
-        });
-        return filtered.length;
+        const data = await res.json();
+        return typeof data.total === 'number' ? data.total : 0;
       } catch { return 0; }
     }
 
@@ -1378,22 +1371,16 @@
       const el = document.getElementById('detailDepositsList');
       el.innerHTML = '<li class="muted">Loading deposits…</li>';
       try {
-        const res = await fetch('/admin/transactions', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/transactions?username=${encodeURIComponent(username)}&type=admin_add_balance&page=1&limit=200`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) throw new Error('Failed');
-        const all = await res.json();
-        let deposits = [];
-        if (Array.isArray(all)) deposits = all;
-        else deposits = Array.isArray(all.deposits) ? all.deposits : [];
-        const filtered = deposits.filter(d => {
-          const t = (d.type || '').toString().toLowerCase();
-          return (d.username === username || d.user === username) && (t.includes('admin_add') || t.includes('admin_add_balance') || t.includes('add_balance'));
-        });
-        filtered.sort((a,b) => new Date(b.createdAt || b.date || 0) - new Date(a.createdAt || a.date || 0));
-        if (!filtered.length) {
+        const data = await res.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        items.sort((a,b) => new Date(b.createdAt || b.date || 0) - new Date(a.createdAt || a.date || 0));
+        if (!items.length) {
           el.innerHTML = '<li class="muted">No admin balance actions found</li>';
           return;
         }
-        el.innerHTML = filtered.map(d => {
+        el.innerHTML = items.map(d => {
           const amount = Number(d.amount || d.value || 0).toFixed(2);
           const date = d.createdAt ? new Date(d.createdAt).toLocaleString() : (d.date ? new Date(d.date).toLocaleString() : '');
           return `<li><div><strong>$${amount}</strong> — <span class="muted">${date}</span></div></li>`;
@@ -1406,11 +1393,10 @@
 
     async function fetchUserWithdrawalsCount(username) {
       try {
-        const res = await fetch('/admin/withdrawals', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/withdrawals?username=${encodeURIComponent(username)}&page=1&limit=1`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) return 0;
-        const all = await res.json();
-        const filtered = (Array.isArray(all) ? all : []).filter(w => (w.username === username || w.user === username));
-        return filtered.length;
+        const data = await res.json();
+        return typeof data.total === 'number' ? data.total : 0;
       } catch { return 0; }
     }
 
@@ -1418,16 +1404,16 @@
       const el = document.getElementById('detailWithdrawalsList');
       el.innerHTML = '<li class="muted">Loading withdrawals…</li>';
       try {
-        const res = await fetch('/admin/withdrawals', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+        const res = await fetch(`/admin/withdrawals?username=${encodeURIComponent(username)}&page=1&limit=200`, { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
         if (!res.ok) throw new Error('Failed');
-        const all = await res.json();
-        const filtered = (Array.isArray(all) ? all : []).filter(w => (w.username === username || w.user === username));
-        filtered.sort((a,b) => new Date(b.createdAt || b.requestedAt || 0) - new Date(a.createdAt || a.requestedAt || 0));
-        if (!filtered.length) {
+        const data = await res.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        items.sort((a,b) => new Date(b.createdAt || b.requestedAt || 0) - new Date(a.createdAt || a.requestedAt || 0));
+        if (!items.length) {
           el.innerHTML = '<li class="muted">No withdrawals</li>';
           return;
         }
-        el.innerHTML = filtered.map((w, idx) => {
+        el.innerHTML = items.map((w, idx) => {
           const amount = Number(w.amount||0).toFixed(2);
           const status = w.status || 'Pending';
           const id = w._id || w.id || w.transactionId || idx;
@@ -1515,7 +1501,7 @@
           showToast('Balance added');
           container.innerHTML = '';
           await loadDepositsForDetail(username);
-          fetchUsers();
+          fetchUsers(1, false);
         } catch (err) {
           console.error(err);
           showToast('Failed to add balance');
@@ -1553,7 +1539,7 @@
         showToast('VIP updated');
         closeVipModal();
         if (window._currentDetailUser === username) await loadUserDetail(username);
-        fetchUsers();
+        fetchUsers(1, false);
       } catch (err) {
         console.error(err);
         showToast('Failed to update VIP');
@@ -1584,9 +1570,8 @@
       editUser(username);
     }
 
-    // Utility: fetch counts used earlier are implemented above.
     // --- Initial load ---
-    fetchUsers();
+    fetchUsers(1, false);
 
     // --- small helpers ---
     function showToast(msg) {
@@ -1610,7 +1595,6 @@
       if (vipModal && vipModal.style.display === 'flex' && evt.target === vipModal) vipModal.style.display = 'none';
     });
 
-    // ensure deposits/withdrawals/combos collapse when another opens - handled in toggleSection
   </script>
 </body>
 </html>
