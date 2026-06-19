@@ -1,3 +1,4 @@
+// (updated) admin (12).js
 const express = require('express');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
@@ -877,6 +878,132 @@ router.get('/combos', asyncHandler(async (req, res) => {
   res.json({ items, total, page, limit });
 }));
 
+// New/Restored combo CRUD endpoints (compatibility with original admin UI)
+// Create combo (primary endpoint used by UI)
+router.post('/combos', asyncHandler(async (req, res) => {
+  const { username, triggerTaskNumber, products } = req.body || {};
+  if (!username || !triggerTaskNumber || !Array.isArray(products) || products.length === 0) {
+    return res.status(400).json({ success: false, message: 'All fields required and at least one product.' });
+  }
+  const combo = {
+    username,
+    triggerTaskNumber,
+    products,
+    createdAt: new Date().toISOString()
+  };
+  const created = await Combo.create(combo);
+  await Log.create({
+    action: 'Combo Assigned (API)',
+    username,
+    combo: { triggerTaskNumber, products },
+    timestamp: new Date().toISOString()
+  }).catch(() => {});
+  res.json({ success: true, combo: created });
+}));
+
+// Get single combo by id
+router.get('/combos/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!id) return res.status(400).json({ success: false, message: 'Invalid combo id' });
+  let combo = null;
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    combo = await Combo.findById(id).lean();
+  }
+  if (!combo) {
+    combo = await Combo.findOne({ $or: [{ id }, { _id: id }] }).lean();
+  }
+  if (!combo) return res.status(404).json({ success: false, message: 'Combo not found' });
+  res.json({ success: true, combo });
+}));
+
+// Update combo
+router.put('/combos/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body || {};
+  if (!id) return res.status(400).json({ success: false, message: 'Invalid combo id' });
+
+  let updated = null;
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    updated = await Combo.findByIdAndUpdate(id, updates, { new: true }).lean();
+  }
+  if (!updated) {
+    updated = await Combo.findOneAndUpdate({ id }, updates, { new: true }).lean();
+  }
+  if (!updated) return res.status(404).json({ success: false, message: 'Combo not found' });
+  res.json({ success: true, combo: updated });
+}));
+
+// Delete combo (path param)
+router.delete('/combos/:id', asyncHandler(async (req, res) => {
+  let { id } = req.params;
+  if (!id) return res.status(400).json({ success: false, message: 'Invalid combo id' });
+
+  try {
+    let result = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      result = await Combo.deleteOne({ _id: id });
+    } else {
+      // try deletion by string _id or legacy id field
+      result = await Combo.deleteOne({ _id: id });
+      if (!result || result.deletedCount === 0) {
+        result = await Combo.deleteOne({ id });
+      }
+    }
+
+    if (!result || result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: 'Combo not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /admin/combos/:id error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+}));
+
+// Fallback delete that accepts query param or JSON body
+router.delete('/combos', asyncHandler(async (req, res) => {
+  const id = req.query.id || (req.body && (req.body.id || req.body._id));
+  if (!id) return res.status(400).json({ success: false, message: 'Missing id' });
+  try {
+    let result = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      result = await Combo.deleteOne({ _id: id });
+    }
+    if (!result || result.deletedCount === 0) {
+      result = await Combo.deleteOne({ id });
+    }
+    if (!result || result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: 'Combo not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /admin/combos (fallback) error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+}));
+
+// Extra fallback POST endpoint commonly tried by legacy clients
+router.post('/combos/delete', asyncHandler(async (req, res) => {
+  const id = req.body && (req.body.id || req.body._id);
+  if (!id) return res.status(400).json({ success: false, message: 'Missing id' });
+  try {
+    let result = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      result = await Combo.deleteOne({ _id: id });
+    }
+    if (!result || result.deletedCount === 0) {
+      result = await Combo.deleteOne({ id });
+    }
+    if (!result || result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: 'Combo not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /admin/combos/delete error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+}));
+
 // Paginated withdrawals endpoint
 // GET /admin/withdrawals?username=foo&status=Pending&page=1&limit=50
 router.get('/withdrawals', asyncHandler(async (req, res) => {
@@ -1159,7 +1286,8 @@ router.post('/assign-combo', asyncHandler(async (req, res) => {
     await Combo.create({
         username,
         triggerTaskNumber,
-        products
+        products,
+        createdAt: new Date().toISOString()
     });
 
     await Log.create({
