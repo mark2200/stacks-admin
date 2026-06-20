@@ -10,6 +10,8 @@
     /* Constrain table height */
     .table-responsive { max-height: 70vh; overflow:auto; }
     .status-badge { padding:4px 8px; border-radius:12px; font-size:12px; }
+    .loading-indicator { display:inline-block; margin-left:8px; font-size:13px; color:#64748b; }
+    .hidden { display:none !important; }
   </style>
 </head>
 <body>
@@ -29,6 +31,8 @@
           <h2>Transactions Management (Admin add-balance history)</h2>
           <input type="text" id="searchInput" placeholder="Search by username or status..." oninput="searchTransactions()" />
           <button class="export-btn" onclick="exportTransactionsCSV()"><i class="fa fa-download"></i> Export CSV</button>
+          <button id="loadMoreTxnsBtn" class="export-btn" style="display:none;" onclick="loadMoreTransactions()"><i class="fa fa-plus"></i> Load more</button>
+          <span id="txnsLoadingIndicator" class="loading-indicator hidden">Loading…</span>
         </div>
         <div class="table-responsive">
           <table>
@@ -81,48 +85,134 @@
 
   <script>
     // --- TRANSACTIONS MANAGEMENT: only show admin add-balance history ---
+
     let selectedTransactions = new Set();
     let editingTransactionIndex = null;
-    let allTransactions = [];
+    let allTransactions = []; // flattened list loaded so far
+    let txnsPage = 1;
+    const txnsPerPage = 100;
+    let txnsTotal = 0;
+    let txnsLoading = false;
 
     function isAdminAddBalance(txn) {
-      // match the admin add-balance transaction created by admin.js: type === "admin_add_balance"
       if (!txn) return false;
       const t = (txn.type || "").toString().toLowerCase();
       return t === 'admin_add_balance' || t.includes('admin_add_balance') || (txn.note && String(txn.note).toLowerCase().includes('admin_add_balance'));
     }
 
-    async function fetchTransactions() {
+    function setTxnsLoading(on) {
+      txnsLoading = !!on;
+      const ind = document.getElementById('txnsLoadingIndicator');
+      if (ind) ind.className = on ? 'loading-indicator' : 'loading-indicator hidden';
+      const btn = document.getElementById('loadMoreTxnsBtn');
+      if (btn) btn.disabled = !!on;
+    }
+
+    async function fetchTransactions(page = 1, append = false) {
+      if (txnsLoading) return;
+      setTxnsLoading(true);
       try {
-        const res = await fetch('/admin/transactions', {
+        const q = encodeURIComponent((document.getElementById('searchInput')||{}).value || '');
+        // Try server paginated endpoint first and ask only for admin_add_balance, to reduce payload
+        let url = `/admin/transactions?page=${page}&limit=${txnsPerPage}&type=admin_add_balance`;
+        if (q) url += `&username=${q}`;
+        const res = await fetch(url, {
           headers: { 'x-admin-token': localStorage.getItem('adminToken') }
         });
-        if (!res.ok) throw new Error('Unauthorized');
-        const data = await res.json();
-        // data may be { deposits: [], withdrawals: [] } or array. We only want admin-added balances.
-        let merged = [];
-        if (Array.isArray(data)) {
-          merged = data;
-        } else {
-          const deposits = Array.isArray(data.deposits) ? data.deposits : [];
-          const withdrawals = Array.isArray(data.withdrawals) ? data.withdrawals : [];
-          merged = deposits.concat(withdrawals);
+
+        if (res.status === 401 || res.status === 403) {
+          alert("Session expired or unauthorized. Please login again.");
+          logout();
+          return;
         }
-        // Filter to only admin add-balance transactions
-        const adminAdds = merged.filter(isAdminAddBalance);
-        // Sort newest-first
-        adminAdds.sort((a,b) => {
-          const da = a.createdAt || a.date || a._createdAt || a.createdAt;
-          const db = b.createdAt || b.date || b._createdAt || b.createdAt;
-          return new Date(db).getTime() - new Date(da).getTime();
-        });
-        allTransactions = adminAdds;
+
+        if (!res.ok) {
+          // fallback: try legacy endpoint without params
+          const res2 = await fetch('/admin/transactions', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+          if (!res2.ok) {
+            showToast('Failed to load transactions (server error).');
+            return;
+          }
+          const legacy = await res2.json();
+          // legacy may be array or {deposits,withdrawals}
+          let merged = [];
+          if (Array.isArray(legacy)) merged = legacy;
+          else {
+            const deposits = Array.isArray(legacy.deposits) ? legacy.deposits : [];
+            const withdrawals = Array.isArray(legacy.withdrawals) ? legacy.withdrawals : [];
+            merged = deposits.concat(withdrawals);
+          }
+          const adminAdds = merged.filter(isAdminAddBalance);
+          adminAdds.sort((a,b) => new Date(b.createdAt || b.date || 0) - new Date(a.createdAt || a.date || 0));
+          if (append) allTransactions = allTransactions.concat(adminAdds);
+          else allTransactions = adminAdds;
+          txnsTotal = allTransactions.length;
+          renderTransactions(allTransactions);
+          // hide load more (we don't know server total)
+          document.getElementById('loadMoreTxnsBtn').style.display = 'none';
+          return;
+        }
+
+        // res.ok true
+        const data = await res.json().catch(()=>null);
+        // support both paginated shape { items, total } and legacy array
+        let items = [];
+        let total = 0;
+        if (data) {
+          if (Array.isArray(data.items)) {
+            items = data.items;
+            total = typeof data.total === 'number' ? data.total : items.length;
+          } else if (Array.isArray(data)) {
+            items = data;
+            total = data.length;
+          } else if (Array.isArray(data.deposits) || Array.isArray(data.withdrawals)) {
+            const deposits = Array.isArray(data.deposits) ? data.deposits : [];
+            const withdrawals = Array.isArray(data.withdrawals) ? data.withdrawals : [];
+            items = deposits.concat(withdrawals).filter(isAdminAddBalance);
+            total = items.length;
+          } else {
+            // unknown shape: try to be defensive
+            items = [];
+            total = 0;
+          }
+        }
+
+        // If server returned items typed transactions but may include non-admin types if type filter ignored; filter defensively
+        items = (items || []).filter(isAdminAddBalance);
+
+        // sort newest-first
+        items.sort((a,b) => new Date(b.createdAt || b.date || 0) - new Date(a.createdAt || a.date || 0));
+
+        if (append) {
+          allTransactions = allTransactions.concat(items);
+        } else {
+          allTransactions = items;
+        }
+        txnsPage = page;
+        txnsTotal = total || allTransactions.length;
+
         renderTransactions(allTransactions);
+
+        // show/hide load more
+        const loadMoreBtn = document.getElementById('loadMoreTxnsBtn');
+        if (loadMoreBtn) {
+          if (allTransactions.length < (txnsTotal || 0)) {
+            loadMoreBtn.style.display = "inline-block";
+          } else {
+            loadMoreBtn.style.display = "none";
+          }
+        }
       } catch (err) {
         console.error('fetchTransactions error', err);
-        alert("Session expired or unauthorized. Please login again.");
-        logout();
+        showToast('Failed to load transactions (see console).');
+      } finally {
+        setTxnsLoading(false);
       }
+    }
+
+    function loadMoreTransactions() {
+      if (txnsLoading) return;
+      fetchTransactions(txnsPage + 1, true);
     }
 
     function renderTransactions(transactions) {
@@ -217,12 +307,14 @@
           body: JSON.stringify({ status })
         });
         if (!res.ok) {
+          if (res.status === 401 || res.status === 403) { alert("Session expired. Please login."); logout(); return; }
           const err = await res.json().catch(()=>({message:'Error'}));
           showToast("Update failed: " + (err && err.message ? err.message : res.statusText));
         } else {
           showToast("Transaction updated!");
           closeTransactionModal();
-          fetchTransactions();
+          // reload first page to reflect change
+          fetchTransactions(1, false);
         }
       }
     };
@@ -240,11 +332,13 @@
         headers: { "x-admin-token": localStorage.getItem('adminToken') }
       });
       if (!res.ok) {
+        if (res.status === 401 || res.status === 403) { alert("Session expired. Please login."); logout(); return; }
         const err = await res.json().catch(()=>({message:'Error'}));
         showToast("Delete failed: " + (err && err.message ? err.message : res.statusText));
       } else {
         showToast("Transaction deleted.");
-        fetchTransactions();
+        // reload current page
+        fetchTransactions(1, false);
       }
     }
 
@@ -261,7 +355,7 @@
       }
       selectedTransactions.clear();
       showToast("Selected transactions deleted.");
-      fetchTransactions();
+      fetchTransactions(1, false);
     }
 
     function exportTransactionsCSV() {
@@ -305,8 +399,8 @@
       }
     }
 
-    // Initial load
-    fetchTransactions();
+    // Initial load - load first page
+    fetchTransactions(1, false);
   </script>
 <script>
 window.addEventListener("message", function(event) {
