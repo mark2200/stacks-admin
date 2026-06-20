@@ -1027,6 +1027,42 @@ router.get('/withdrawals', asyncHandler(async (req, res) => {
   res.json({ items, total, page, limit });
 }));
 
+// ===================== ADDED: Paginated tasks endpoint ===================== //
+// GET /admin/tasks?page=1&limit=50&username=...&status=...&q=search
+router.get('/tasks', asyncHandler(async (req, res) => {
+  const { username, status } = req.query;
+  let page = Math.max(1, parseInt(req.query.page || '1', 10));
+  let limit = Math.min(1000, Math.max(1, parseInt(req.query.limit || '50', 10)));
+  const search = (req.query.q || '').toString().trim();
+
+  const q = {};
+  if (username) q.$or = [{ username }, { user: username }];
+  if (status) q.status = status;
+
+  if (search) {
+    const esc = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(esc, 'i');
+    q.$or = q.$or || [];
+    q.$or.push(
+      { name: { $regex: regex } },
+      { 'product.name': { $regex: regex } },
+      { username: { $regex: regex } },
+      { user: { $regex: regex } }
+    );
+  }
+
+  const [total, items] = await Promise.all([
+    Task.countDocuments(q),
+    Task.find(q)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean()
+  ]);
+
+  res.json({ items, total, page, limit });
+}));
+
 // (Other product/task/notification endpoints remain unchanged but are kept below for completeness.)
 
 router.get('/products', asyncHandler(async (_, res) => {
