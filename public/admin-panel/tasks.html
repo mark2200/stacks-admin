@@ -17,6 +17,8 @@
     @media (max-width:600px) {
       .table-responsive { max-height: 50vh; }
     }
+    .loading-indicator { display:inline-block; margin-left:8px; font-size:13px; color:#64748b; }
+    .hidden { display:none !important; }
   </style>
 </head>
 <body>
@@ -37,6 +39,7 @@
           <input type="text" id="searchInput" placeholder="Search by task name, user, or status..." oninput="searchTasks()" />
           <button class="add-btn" onclick="showAddTaskModal()"><i class="fa fa-plus"></i> Add Task</button>
           <button class="export-btn" onclick="exportTasksCSV()"><i class="fa fa-download"></i> Export CSV</button>
+          <span id="tasksLoadingIndicator" class="loading-indicator hidden">Loading…</span>
         </div>
         <div class="table-responsive">
           <table>
@@ -107,6 +110,13 @@
     let perPage = 50;
     let totalPages = 1;
     let currentViewTasks = []; // tasks currently displayed (for current page/filter)
+    let tasksLoading = false;
+
+    function setTasksLoading(on) {
+      tasksLoading = !!on;
+      const ind = document.getElementById('tasksLoadingIndicator');
+      if (ind) ind.className = on ? 'loading-indicator' : 'loading-indicator hidden';
+    }
 
     // Utility: sort tasks newest-first by completedAt > startedAt > createdAt
     function sortTasksDesc(arr) {
@@ -121,6 +131,8 @@
 
     // Try to request server-side paginated tasks (if backend supports page/limit)
     async function fetchTasks(page = 1, limit = perPage) {
+      if (tasksLoading) return;
+      setTasksLoading(true);
       try {
         // Attempt server paginated request
         const url = `/admin/tasks?page=${page}&limit=${limit}`;
@@ -142,6 +154,7 @@
           currentPage = page;
           renderTasks(items);
           renderPagination();
+          setTasksLoading(false);
           return;
         }
 
@@ -152,6 +165,7 @@
           totalPages = Math.max(1, Math.ceil(allTasks.length / perPage));
           currentPage = 1;
           renderTasksPage(1);
+          setTasksLoading(false);
           return;
         }
 
@@ -163,7 +177,10 @@
           const res2 = await fetch('/admin/tasks', {
             headers: { 'x-admin-token': localStorage.getItem('adminToken') }
           });
-          if (!res2.ok) throw new Error('Unauthorized');
+          if (!res2.ok) {
+            if (res2.status === 401 || res2.status === 403) { alert("Session expired or unauthorized. Please login again."); logout(); return; }
+            throw new Error('Unauthorized');
+          }
           const data2 = await res2.json();
           if (!Array.isArray(data2)) allTasks = [];
           else allTasks = sortTasksDesc(data2);
@@ -174,6 +191,8 @@
           console.error('fetchTasks fallback failed', e);
           alert("Session expired or unauthorized. Please login again.");
           logout();
+        } finally {
+          setTasksLoading(false);
         }
       }
     }
@@ -262,73 +281,49 @@
     function toggleSelectAllTasks(master) {
       selectedTasks = new Set();
       if (master.checked) {
-        // select visible tasks only (on current view)
         if (serverSupportsPaging) {
-          // make best-effort: select range on currentPage
-          // We don't have total mapping of global indexes if server supports paging, so store visible indexes as 0..N-1 in a separate set (use mapping)
-          // For simplicity, when serverSupportsPaging, we'll not support select-all across all pages; only select visible shown rows
           const visibleCount = currentViewTasks.length;
           const base = (currentPage - 1) * perPage;
           for (let i = 0; i < visibleCount; i++) selectedTasks.add(base + i);
         } else {
-          // client-side: select all items
           for (let i = 0; i < allTasks.length; i++) selectedTasks.add(i);
         }
       }
-      // Re-render (so checkboxes reflect selection state)
-      if (serverSupportsPaging) {
-        renderTasks(currentViewTasks);
-      } else {
-        renderTasksPage(currentPage);
-      }
+      if (serverSupportsPaging) renderTasks(currentViewTasks);
+      else renderTasksPage(currentPage);
     }
 
-    // Search uses client-side filter (if server supports it, page will be refreshed)
     function searchTasks() {
       const query = document.getElementById("searchInput").value.toLowerCase();
       if (query === "") {
-        // reset to current page
-        if (serverSupportsPaging) {
-          fetchTasks(currentPage, perPage);
-        } else {
-          renderTasksPage(1);
-        }
+        if (serverSupportsPaging) fetchTasks(currentPage, perPage);
+        else renderTasksPage(1);
         return;
       }
 
-      // Filter client-side from allTasks (if not loaded, fetch first)
-      if (!allTasks.length && !serverSupportsPaging) {
-        fetchTasks();
-        return;
-      }
+      if (!allTasks.length && !serverSupportsPaging) { fetchTasks(); return; }
 
-      // Filter and display first page of matching results
-      const filtered = (serverSupportsPaging ? currentViewTasks : allTasks).filter(task =>
+      const source = serverSupportsPaging ? currentViewTasks : allTasks;
+      const filtered = source.filter(task =>
         ((task.username || task.user || "").toLowerCase().includes(query)) ||
         ((task.product && task.product.name ? task.product.name : (task.name || "")).toLowerCase().includes(query)) ||
         ((task.status || "").toLowerCase().includes(query))
       );
-      // sort newest-first
       const sorted = sortTasksDesc(filtered.slice());
-      // show results (no pagination for search results)
       currentViewTasks = sorted;
       renderTasks(sorted);
       document.getElementById('paginationControls').style.display = 'none';
     }
 
-    // Mapping helpers for operations that need original task object when paginated
     function getTaskByGlobalIndex(globalIndex) {
-      if (!serverSupportsPaging) {
-        return allTasks[globalIndex];
-      } else {
-        // server supports paging; we have currentViewTasks and a base offset
+      if (!serverSupportsPaging) return allTasks[globalIndex];
+      else {
         const base = (currentPage - 1) * perPage;
         const visibleIndex = globalIndex - base;
         return currentViewTasks[visibleIndex];
       }
     }
 
-    // Add/Edit Task
     function showAddTaskModal() {
       editingTaskIndex = null;
       document.getElementById("taskModalTitle").textContent = "Add Task";
@@ -346,7 +341,6 @@
       const status = document.getElementById("modalStatus").value;
 
       if (editingTaskIndex !== null) {
-        // Edit
         const task = getTaskByGlobalIndex(editingTaskIndex);
         await fetch(`/admin/tasks/${encodeURIComponent(task.taskCode || task.id)}`, {
           method: 'PUT',
@@ -358,7 +352,6 @@
         });
         showToast("Task updated!");
       } else {
-        // Add
         await fetch('/admin/tasks', {
           method: 'POST',
           headers: {
@@ -408,7 +401,6 @@
       }
     }
 
-    // Admin bulk actions operate on selected global indexes
     async function bulkCompleteTasks() {
       for (let globalIndex of Array.from(selectedTasks)) {
         const task = getTaskByGlobalIndex(globalIndex);
@@ -437,7 +429,6 @@
       fetchTasks(currentPage, perPage);
     }
 
-    // Export tasks to CSV (latest first)
     function exportTasksCSV() {
       const source = serverSupportsPaging ? currentViewTasks : allTasks;
       const arr = source.length ? sortTasksDesc(source.slice()) : [];
