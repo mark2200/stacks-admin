@@ -83,6 +83,8 @@
     @media (max-width: 700px) {
       .autocomplete-list { width: 92%; left: 4%; }
     }
+    .loading-indicator { display:inline-block; margin-left:8px; font-size:13px; color:#64748b; }
+    .hidden { display:none !important; }
   </style>
 </head>
 <body>
@@ -146,6 +148,10 @@
             </table>
           </div>
           <div id="historyFooter" style="margin-top:8px;" class="small-muted"></div>
+          <div style="margin-top:8px;">
+            <button id="loadMoreHistoryBtn" class="export-history-btn" style="display:none;" onclick="loadMoreHistory()">Load more</button>
+            <span id="historyLoadingIndicator" class="loading-indicator hidden">Loading…</span>
+          </div>
         </div>
         <!-- END History section -->
 
@@ -160,18 +166,33 @@
     let allUsersCache = [];
     let selectedUser = null;
 
-    // ADMIN HISTORY DATA
-    let adminHistory = [];       // all fetched admin_add_balance txns
+    // ADMIN HISTORY DATA (paginated)
+    let adminHistory = [];       // flattened loaded pages of admin_add_balance txns
     let filteredAdminHistory = []; // filtered view for search
+    let historyPage = 1;
+    const historyPerPage = 100;
+    let historyTotal = 0;
+    let historyLoading = false;
 
-    // Fetch all users for autocomplete
+    function setHistoryLoading(on) {
+      historyLoading = !!on;
+      const ind = document.getElementById('historyLoadingIndicator');
+      if (ind) ind.className = on ? 'loading-indicator' : 'loading-indicator hidden';
+      const btn = document.getElementById('loadMoreHistoryBtn');
+      if (btn) btn.disabled = !!on;
+    }
+
+    // Fetch all users for autocomplete (keeps legacy behavior)
     async function fetchAllUsers() {
       try {
-        const res = await fetch("/admin/users", {
+        const res = await fetch("/admin/users?page=1&limit=1000", {
           headers: { "x-admin-token": localStorage.getItem("adminToken") }
         });
         if (res.ok) {
-          allUsersCache = await res.json();
+          const data = await res.json();
+          // server returns { users, page, total } in newer admin; handle both shapes
+          if (data && Array.isArray(data.users)) allUsersCache = data.users;
+          else if (Array.isArray(data)) allUsersCache = data;
         }
       } catch {}
     }
@@ -212,7 +233,6 @@
     }
 
     async function selectUser(username) {
-      // Fetch user data for up-to-date balance
       try {
         const res = await fetch(`/admin/users/${encodeURIComponent(username)}`, {
           headers: { "x-admin-token": localStorage.getItem("adminToken") }
@@ -232,7 +252,6 @@
       }
     }
 
-    // Handle submission
     document.getElementById("addBalanceForm").onsubmit = async function(e) {
       e.preventDefault();
       const username = document.getElementById("username").value.trim();
@@ -257,10 +276,12 @@
           document.getElementById("addBalanceForm").reset();
           document.getElementById("balanceDisplay").textContent = "";
           fetchAllUsers();
-          // Refresh history to show the new admin_add_balance transaction
-          fetchAdminAddHistory();
+          // Refresh history (load first page again)
+          adminHistory = [];
+          historyPage = 1;
+          fetchAdminAddHistory(1, false);
         } else {
-          const data = await res.json();
+          const data = await res.json().catch(()=>({}));
           showToast("Error: " + (data.message || "Failed to add balance."));
         }
       } catch (err) {
@@ -268,7 +289,6 @@
       }
     };
 
-    // Hide autocomplete on click outside
     document.addEventListener('click', function(event) {
       if (!event.target.closest('#autocomplete') && event.target.id !== 'username') {
         document.getElementById('autocomplete').style.display = 'none';
@@ -283,37 +303,90 @@
     }
 
     // ---------------------------
-    // Admin Add Balance History
+    // Admin Add Balance History (paginated)
     // ---------------------------
 
-    // Fetch transactions from /admin/transactions and filter admin_add_balance type
-    async function fetchAdminAddHistory() {
+    async function fetchAdminAddHistory(page = 1, append = false) {
+      setHistoryLoading(true);
       const bodyEl = document.getElementById('adminHistoryBody');
-      bodyEl.innerHTML = '<tr><td colspan="6" class="history-empty">Loading history...</td></tr>';
+      if (!append) bodyEl.innerHTML = '<tr><td colspan="6" class="history-empty">Loading history...</td></tr>';
       document.getElementById('historyFooter').textContent = '';
 
       try {
-        const res = await fetch('/admin/transactions', {
+        // Use server-side filtered endpoint for type=admin_add_balance
+        const res = await fetch(`/admin/transactions?type=admin_add_balance&page=${page}&limit=${historyPerPage}`, {
           headers: { 'x-admin-token': localStorage.getItem('adminToken') }
         });
-        if (!res.ok) {
+
+        if (res.status === 401 || res.status === 403) {
           bodyEl.innerHTML = '<tr><td colspan="6" class="history-empty">Unauthorized or failed to fetch history.</td></tr>';
+          alert("Session expired or unauthorized. Please login again.");
+          logout();
           return;
         }
-        const data = await res.json();
 
-        // Normalize incoming shape similar to transactions page
-        let deposits = [];
-        let withdrawals = [];
-        if (Array.isArray(data)) {
-          deposits = data;
-        } else {
-          deposits = Array.isArray(data.deposits) ? data.deposits : [];
-          withdrawals = Array.isArray(data.withdrawals) ? data.withdrawals : [];
+        if (!res.ok) {
+          // fallback to legacy /admin/transactions
+          const res2 = await fetch('/admin/transactions', { headers: { 'x-admin-token': localStorage.getItem('adminToken') } });
+          if (!res2.ok) {
+            bodyEl.innerHTML = '<tr><td colspan="6" class="history-empty">Unauthorized or failed to fetch history.</td></tr>';
+            return;
+          }
+          const legacy = await res2.json();
+          let deposits = [];
+          let withdrawals = [];
+          if (Array.isArray(legacy)) deposits = legacy;
+          else {
+            deposits = Array.isArray(legacy.deposits) ? legacy.deposits : [];
+            withdrawals = Array.isArray(legacy.withdrawals) ? legacy.withdrawals : [];
+          }
+          let merged = deposits.concat(withdrawals);
+          merged = merged.map(item => ({
+            raw: item,
+            id: item.id || item._id || item.transactionId || "",
+            type: (item.type || "").toString(),
+            user: item.username || item.user || "",
+            amount: item.amount !== undefined ? Number(item.amount) : (item.value !== undefined ? Number(item.value) : 0),
+            status: item.status || "Completed",
+            createdAt: item.createdAt || item.date || item.createdAt,
+            reference: item.reference || item.ref || item.txRef || ""
+          }));
+          const matches = merged.filter(it => {
+            const t = (it.type || "").toString().toLowerCase();
+            if (t.includes('admin_add_balance') || t.includes('admin add balance') || t === 'adminaddbalance') return true;
+            if ((it.raw && it.raw.type && it.raw.type.toString().toLowerCase().includes('admin_add_balance'))) return true;
+            return false;
+          });
+          matches.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+          if (append) adminHistory = adminHistory.concat(matches);
+          else adminHistory = matches;
+          filteredAdminHistory = adminHistory.slice();
+          renderAdminHistory(filteredAdminHistory);
+          setHistoryLoading(false);
+          document.getElementById('loadMoreHistoryBtn').style.display = 'none';
+          return;
         }
 
-        let merged = [];
-        merged = merged.concat(deposits.map(item => ({
+        // res.ok
+        const data = await res.json().catch(()=>null);
+        let items = [];
+        let total = 0;
+        if (data) {
+          if (Array.isArray(data.items)) {
+            items = data.items;
+            total = typeof data.total === 'number' ? data.total : items.length;
+          } else if (Array.isArray(data)) {
+            items = data;
+            total = data.length;
+          } else if (Array.isArray(data.deposits) || Array.isArray(data.withdrawals)) {
+            const deposits = Array.isArray(data.deposits) ? data.deposits : [];
+            items = deposits; // only looking for deposits (admin adds)
+            total = items.length;
+          }
+        }
+
+        // Normalize items (map to our rendering shape)
+        const normalized = (items || []).map(item => ({
           raw: item,
           id: item.id || item._id || item.transactionId || "",
           type: (item.type || "").toString(),
@@ -322,40 +395,30 @@
           status: item.status || "Completed",
           createdAt: item.createdAt || item.date || item.createdAt,
           reference: item.reference || item.ref || item.txRef || ""
-        })));
-        merged = merged.concat(withdrawals.map(item => ({
-          raw: item,
-          id: item.id || item._id || item.transactionId || "",
-          type: (item.type || "").toString(),
-          user: item.username || item.user || "",
-          amount: item.amount !== undefined ? Number(item.amount) : (item.value !== undefined ? Number(item.value) : 0),
-          status: item.status || "Pending",
-          createdAt: item.createdAt || item.date || item.createdAt,
-          reference: item.reference || item.ref || item.txRef || ""
-        })));
+        }));
 
-        // Filter only admin_add_balance transactions.
-        // The DB sometimes writes type: "admin_add_balance" (exact) — be robust and match case-insensitive and allow underscores/spaces.
-        const matches = merged.filter(it => {
-          const t = (it.type || "").toString().toLowerCase();
-          // match exact or contains admin and add and balance keywords
-          if (t.includes('admin_add_balance') || t.includes('admin add balance') || t === 'adminaddbalance') return true;
-          // also support older-style type fields where type may be "admin_add_balance" stored in raw.type
-          if ((it.raw && it.raw.type && it.raw.type.toString().toLowerCase().includes('admin_add_balance'))) return true;
-          return false;
-        });
+        normalized.sort((a,b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 
-        // Sort newest first by createdAt (best-effort)
-        matches.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+        if (append) adminHistory = adminHistory.concat(normalized);
+        else adminHistory = normalized;
 
-        // Store for search/filter
-        adminHistory = matches;
-        filteredAdminHistory = matches.slice();
+        historyPage = page;
+        historyTotal = total || adminHistory.length;
 
+        filteredAdminHistory = adminHistory.slice();
         renderAdminHistory(filteredAdminHistory);
+
+        const loadMoreBtn = document.getElementById('loadMoreHistoryBtn');
+        if (loadMoreBtn) {
+          if (adminHistory.length < (historyTotal || 0)) loadMoreBtn.style.display = 'inline-block';
+          else loadMoreBtn.style.display = 'none';
+        }
+
       } catch (err) {
         console.error('fetchAdminAddHistory error', err);
         bodyEl.innerHTML = '<tr><td colspan="6" class="history-empty">Failed to load history.</td></tr>';
+      } finally {
+        setHistoryLoading(false);
       }
     }
 
@@ -367,7 +430,6 @@
         footer.textContent = '';
         return;
       }
-      // Limit to latest 200 entries to avoid massive DOM
       const limited = list.slice(0, 200);
       bodyEl.innerHTML = '';
       limited.forEach(txn => {
@@ -389,9 +451,8 @@
 
     function filterAdminHistory() {
       const q = (document.getElementById('historySearch').value || '').trim().toLowerCase();
-      if (!q) {
-        filteredAdminHistory = adminHistory.slice();
-      } else {
+      if (!q) filteredAdminHistory = adminHistory.slice();
+      else {
         filteredAdminHistory = adminHistory.filter(txn =>
           (txn.user && txn.user.toString().toLowerCase().includes(q)) ||
           (txn.reference && txn.reference.toString().toLowerCase().includes(q)) ||
@@ -399,6 +460,11 @@
         );
       }
       renderAdminHistory(filteredAdminHistory);
+    }
+
+    function loadMoreHistory() {
+      if (historyLoading) return;
+      fetchAdminAddHistory(historyPage + 1, true);
     }
 
     function exportAdminHistoryCSV() {
@@ -419,7 +485,6 @@
       showToast("History exported to CSV");
     }
 
-    // Basic HTML-escape helper
     function escapeHtml(str) {
       if (str === null || typeof str === 'undefined') return '';
       return String(str)
@@ -430,8 +495,8 @@
         .replaceAll("'", '&#39;');
     }
 
-    // Load history on page load
-    fetchAdminAddHistory();
+    // Load first page on page load
+    fetchAdminAddHistory(1, false);
 
     // Expose fetchAdminAddHistory globally (useful for debugging)
     window.fetchAdminAddHistory = fetchAdminAddHistory;
