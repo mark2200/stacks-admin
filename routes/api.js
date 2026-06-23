@@ -522,19 +522,26 @@ router.post('/users/register', async (req, res) => {
         return res.status(400).json({ success: false, message: "All fields (username, phone, loginPassword, withdrawalPassword, inviteCode) are required." });
     }
 
-    const usernameExists = await User.findOne({ username });
+    const usernameTrim = String(username).trim();
+    const phoneTrim = String(phone).trim();
+
+    // Case-insensitive checks to avoid duplicates by casing
+    const usernameRegex = new RegExp('^' + usernameTrim.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i');
+    const phoneRegex = new RegExp('^' + phoneTrim.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i');
+
+    const usernameExists = await User.findOne({ username: { $regex: usernameRegex } });
     if (usernameExists) {
-        return res.json({ success: false, message: "Username already exists." });
+        return res.status(409).json({ success: false, message: "Username already exists." });
     }
 
-    const phoneExists = await User.findOne({ phone });
+    const phoneExists = await User.findOne({ phone: { $regex: phoneRegex } });
     if (phoneExists) {
-        return res.json({ success: false, message: "Phone already registered." });
+        return res.status(409).json({ success: false, message: "Phone already registered." });
     }
 
     const referrer = await User.findOne({ $or: [{ inviteCode: inviteCode.trim() }, { invite_code: inviteCode.trim() }] });
     if (!referrer) {
-        return res.json({ success: false, message: "Invalid invitation code. Please provide a valid code from an existing user." });
+        return res.status(400).json({ success: false, message: "Invalid invitation code. Please provide a valid code from an existing user." });
     }
 
     let userInviteCode, unique = false, tries = 0;
@@ -549,10 +556,10 @@ router.post('/users/register', async (req, res) => {
     }
 
     const newUser = {
-        username: username.trim(),
-        phone: phone.trim(),
-        loginPassword: loginPassword.trim(),
-        withdrawPassword: withdrawalPassword.trim(),
+        username: usernameTrim,
+        phone: phoneTrim,
+        loginPassword: String(loginPassword).trim(),
+        withdrawPassword: String(withdrawalPassword).trim(),
         gender: gender || "Male",
         inviteCode: userInviteCode,
         referredBy: inviteCode.trim(),
@@ -571,9 +578,18 @@ router.post('/users/register', async (req, res) => {
         creditScore: 100
     };
 
-    await User.create(newUser);
-
-    return res.json({ success: true, user: newUser });
+    try {
+        const created = await User.create(newUser);
+        return res.json({ success: true, user: created });
+    } catch (err) {
+        const msg = err && err.message ? err.message : String(err);
+        console.error('Registration create error:', msg);
+        // Handle duplicate key race (two requests validated uniqueness then raced to insert)
+        if (err && err.code && (err.code === 11000 || err.code === 11001)) {
+            return res.status(409).json({ success: false, message: 'Username or phone already exists.' });
+        }
+        return res.status(500).json({ success: false, message: 'Failed to create user', error: msg });
+    }
 });
 
 // Authentication (login) — trigger async cache pre-warm so subsequent start-task is fast
@@ -1252,8 +1268,6 @@ router.patch('/admin/users/:userId/credit_score', async (req, res) => {
 });
 
 // ----------------------- Admin Endpoint: Invalidate All Tokens (NEW) -----------------------
-// Admin can trigger this to permanently invalidate tokens issued before now for all users.
-// Useful to quickly revoke access across all devices.
 router.post('/admin/invalidate-all-tokens', async (req, res) => {
   const { adminSecret } = req.body;
   const ADMIN_SECRET = 'yoursecretpassword';
@@ -1431,156 +1445,16 @@ router.post('/change-password', verifyUserToken, async (req, res) => {
     const user = await User.findById(req.user._id);
 
     if (!user.loginPassword || user.loginPassword !== oldPassword) {
-        return res.json({ success: false, message: "Old password is incorrect." });
+        return res.status(400).json({ success: false, message: 'Old password is incorrect.' });
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.trim().length < 4) {
+        return res.status(400).json({ success: false, message: 'New password must be at least 4 characters.' });
     }
 
     user.loginPassword = newPassword;
-    user.token = ""; // Invalidate token on password change (force re-login across devices)
-    user.tokenIssuedAt = null;
     await user.save();
-
-    res.json({ success: true, message: "Password updated successfully. Please log in again." });
+    res.json({ success: true, message: 'Password changed.' });
 });
 
-// Change withdraw password
-router.post('/change-withdraw-password', verifyUserToken, async (req, res) => {
-    const { oldPassword, newPassword } = req.body;
-    const user = req.user;
-
-    let current = user.withdrawPassword || user.withdrawalPassword;
-    if (!current || current !== oldPassword) {
-        return res.json({ success: false, message: "Old withdrawal password is incorrect." });
-    }
-    user.withdrawPassword = newPassword;
-    if (user.withdrawalPassword) user.withdrawalPassword = undefined;
-
-    try {
-        await user.save();
-        res.json({ success: true, message: "Withdrawal password updated successfully." });
-    } catch (err) {
-        res.status(500).json({ success: false, message: "Failed to save new withdrawal password. Try again later." });
-    }
-});
-
-// Notifications
-router.get('/notifications', verifyUserToken, async (req, res) => {
-    const notifications = await Notification.find({}).sort({ date: -1 });
-    res.json({ success: true, notifications });
-});
-
-router.post('/admin/notification', async (req, res) => {
-    const { title, message } = req.body;
-    await Notification.create({
-        id: Date.now(),
-        title,
-        message,
-        date: new Date().toISOString()
-    });
-    res.json({ success: true });
-});
-
-// ----------------------- Translation endpoint (dynamic, cached) -----------------------
-// This endpoint returns a JSON object for the requested namespace (ns) and language (lng).
-// Behaviour:
-// 1. If a translations document exists in the `translations` collection for {lng, ns} it is returned.
-// 2. If not, it will attempt to locate an English source (lng='en') for the same ns and:
-//    - if a translation provider API key is set (DEEPL_API_KEY or GOOGLE_API_KEY) it will auto-translate values,
-//      cache the result in `translations` collection and return it.
-//    - otherwise it will return the English source (fallback) or an empty object.
-//
-// Notes:
-// - To enable automatic translation, set process.env.DEEPL_API_KEY or process.env.GOOGLE_API_KEY on your server.
-router.get('/translate', async (req, res) => {
-  const { lng, ns } = req.query;
-  if (!lng || !ns) {
-    return res.status(400).json({ success: false, message: "Missing 'lng' or 'ns' query parameter" });
-  }
-
-  try {
-    const Translation = mongoose.models.Translation || mongoose.model('Translation',
-      new mongoose.Schema({ lng: String, ns: String, data: Object }, { collection: 'translations', strict: false })
-    );
-
-    // 1) If we already have cached translations for this lang/namespace, return them
-    const existing = await Translation.findOne({ lng, ns });
-    if (existing && existing.data && Object.keys(existing.data).length) {
-      return res.json(existing.data);
-    }
-
-    // 2) Otherwise attempt to use an English base (if available)
-    const baseDoc = await Translation.findOne({ lng: 'en', ns });
-    const baseData = baseDoc && baseDoc.data ? baseDoc.data : {};
-
-    // If requested English or no base data, return base (maybe empty)
-    if (lng === 'en') {
-      return res.json(baseData);
-    }
-    if (!Object.keys(baseData).length) {
-      // Nothing to translate - return empty object
-      return res.json({});
-    }
-
-    // Prepare keys and texts for translation
-    const keys = Object.keys(baseData);
-    const texts = keys.map(k => String(baseData[k] || ''));
-
-    let translatedData = {};
-
-    // 3) Use DeepL if configured
-    if (process.env.DEEPL_API_KEY) {
-      try {
-        const params = new URLSearchParams();
-        params.append('auth_key', process.env.DEEPL_API_KEY);
-        texts.forEach(t => params.append('text', t));
-        // DeepL expects uppercase language codes like "IT"
-        params.append('target_lang', String(lng).toUpperCase());
-
-        const resp = await axios.post('https://api-free.deepl.com/v2/translate', params.toString(), {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        });
-
-        const translations = (resp.data && resp.data.translations) ? resp.data.translations.map(t => t.text) : [];
-        keys.forEach((k, i) => {
-          translatedData[k] = translations[i] || texts[i];
-        });
-      } catch (err) {
-        console.error('DeepL translation error:', err && err.message ? err.message : err);
-        // fallback to baseData
-        translatedData = { ...baseData };
-      }
-    }
-    // 4) Use Google Translate if configured
-    else if (process.env.GOOGLE_API_KEY) {
-      try {
-        const resp = await axios.post(`https://translation.googleapis.com/language/translate/v2?key=${process.env.GOOGLE_API_KEY}`, {
-          q: texts,
-          target: lng
-        });
-        const translations = (resp.data && resp.data.data && resp.data.data.translations) ? resp.data.data.translations.map(t => t.translatedText) : [];
-        keys.forEach((k, i) => {
-          translatedData[k] = translations[i] || texts[i];
-        });
-      } catch (err) {
-        console.error('Google Translate error:', err && err.message ? err.message : err);
-        translatedData = { ...baseData };
-      }
-    } else {
-      // No translation provider configured — return baseData as fallback
-      translatedData = { ...baseData };
-    }
-
-    // Cache translatedData for future requests (best-effort)
-    try {
-      await Translation.updateOne({ lng, ns }, { $set: { data: translatedData } }, { upsert: true });
-    } catch (e) {
-      console.warn('Failed to cache translations:', e && e.message ? e.message : e);
-    }
-
-    return res.json(translatedData);
-  } catch (err) {
-    console.error('translate endpoint error:', err && err.message ? err.message : err);
-    return res.status(500).json({ success: false, message: 'Translation processing failed', error: err.message });
-  }
-});
-
+// End of file exports
 module.exports = router;
