@@ -74,7 +74,7 @@ app.use(
       "https://stacksapp.pages.dev",
       "http://localhost:5173",
       "https://stacksl.onrender.com",
-      "https://stacksl.netlify.app",
+      "https://stacks-48in.onrender.com",
     ],
     credentials: true,
     allowedHeaders: [
