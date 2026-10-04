@@ -68,7 +68,7 @@ app.get("/health", require("./src/health"));
 app.use(
   cors({
     origin: [
-      "https://stackswork.netlify.app",
+      "http://localhost:5174",
       "https://stacksl.com",
       "https://www.stacksl.com",
       "https://stacksapp.pages.dev",
