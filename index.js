@@ -68,7 +68,7 @@ app.get("/health", require("./src/health"));
 app.use(
   cors({
     origin: [
-      "http://localhost:5174",
+      "https://amiina19960-droid.github.io",
       "https://stacksl.com",
       "https://www.stacksl.com",
       "https://stacksapp.pages.dev",
